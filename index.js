@@ -3,15 +3,47 @@ const exec = require("@actions/exec");
 const fs = require("fs-extra");
 const { spawn } = require("child_process");
 
+async function cloneAndPrepareROCBinary() {
+  const repoDir = "/tmp/roc-agent";
+  const binaryPath = "/tmp/roc-agent/roc";
+
+  // Clone the repository
+  core.info(`Cloning ROC agent repository to: ${repoDir}`);
+  await exec.exec("git", [
+    "clone",
+    "https://github.com/Securable-ai/roc-agent.git",
+    repoDir,
+  ]);
+
+  core.info(`Making ROC binary executable at ${binaryPath}`);
+  await exec.exec("chmod", ["+x", binaryPath]);
+
+  return binaryPath;
+}
+
 async function run() {
   try {
     core.info("Starting ROC Action...");
 
     // Get inputs from workflow
     const rocBinaryPath = core.getInput("roc_binary_path", {
-      required: true,
+      required: false, // No longer required since we'll clone the repo if not provided
     });
     const setupDependencies = core.getInput("setup_dependencies") === "true";
+
+    // Determine the path for the ROC binary
+    let finalROCBinaryPath;
+    if (rocBinaryPath) {
+      // Use the provided path if specified (for backward compatibility)
+      finalROCBinaryPath = rocBinaryPath;
+      core.info(`Using provided ROC binary path: ${finalROCBinaryPath}`);
+    } else {
+      // Clone the repository and use the binary from there
+      core.info(
+        "ROC binary path not provided, cloning repository from GitHub...",
+      );
+      finalROCBinaryPath = await cloneAndPrepareROCBinary();
+    }
 
     if (setupDependencies) {
       core.info("Setting up dependencies...");
@@ -33,11 +65,11 @@ async function run() {
       await fs.ensureDir(watchDir);
     }
 
-    core.info(`Making ROC binary executable at ${rocBinaryPath}`);
-    await exec.exec("chmod", ["+x", rocBinaryPath]);
+    core.info(`Making ROC binary executable at ${finalROCBinaryPath}`);
+    await exec.exec("chmod", ["+x", finalROCBinaryPath]);
 
     // Construct arguments for the roc binary
-    const rocArgs = [rocBinaryPath];
+    const rocArgs = [finalROCBinaryPath];
 
     const inputs = {
       "server-url": core.getInput("server_url", { required: true }),
