@@ -1,9 +1,9 @@
-name: Test ROC Action Package
+name: Test ROC Agent (Docker)
 on:
     workflow_dispatch:
 
 jobs:
-    test-roc-action:
+    test-roc-agent:
         runs-on: ubuntu-latest
         permissions:
             contents: read
@@ -12,40 +12,21 @@ jobs:
             - name: Checkout repository
               uses: actions/checkout@v4
 
-            - name: Create Patterns File
-              run: |
-                  mkdir roc-resultsa
-                  cat <<EOF > patterns.yaml
-                  patterns:
-                    - id: "simple_number"
-                      regex: "1234"
-                    - id: "another_pattern"
-                      regex: "SECRET_[A-Z0-9]{16}"
-                    - id: "test_number"
-                      regex: "12345667788764"
-                  whitelist:
-                    domains:
-                      - "google.com"
-                      - "httpbin.org"
-                    urls:
-                      - "https://google.com"
-                  EOF
-
-            - name: Start ROC Agent
+            - name: Start ROC Agent (Docker)
               id: roc-start
-              uses: Securable-ai/roc-agent@main # Use the deployed action
+              uses: ./ # Use local action for testing, or replace with Securable-ai/roc-agent@main
               with:
-                  server_url: https://api.codexsecurity.io
+                  server_url: https://api.codexsecurity.io/graphql
                   api_key: ${{ secrets.ROC_API_KEY }}
-                  project_identifier: ${{ github.repository }}
-                  patterns_file: "patterns.yaml"
-                  watch_dir: "./roc-results"
+                  project_name: ${{ github.repository }}
+                  print_only: true
+                  debug: true
 
             - name: Simulate Network Traffic
               run: |
                   echo "ROC process started with PID: ${{ steps.roc-start.outputs.roc_pid }}"
                   echo "Waiting for ROC to initialize..."
-                  sleep 60
+                  sleep 10
                   echo "Generating curl traffic..."
                   curl -s -X POST "https://httpbin.org/post?test=12345667788764" \
                     -H "Content-Type: application/json" \

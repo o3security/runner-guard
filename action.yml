@@ -74,6 +74,10 @@ inputs:
   config:
     description: "Path to configuration file (YAML/JSON) for complex setups"
     required: false
+  print_only:
+    description: "Print events to stdout only (no server upload)"
+    required: false
+    default: "false"
   roc_binary_path:
     description: "Path to the ROC binary (if not provided, the binary will be cloned from the repository)"
     required: false
