@@ -26,7 +26,7 @@ async function run() {
 
     // ── Inputs ────────────────────────────────────────────────────────────
     const apiKey = core.getInput("api_key");
-    const serverUrl = core.getInput("server_url");
+    const serverUrl = core.getInput("server_url") || "https://api.codexsecurity.io";
     const projectName = core.getInput("project_name");
     // Inline policy (open-source / no-dashboard mode)
     const policy = core.getInput("policy") || "audit";
@@ -48,15 +48,12 @@ async function run() {
     const dockerImage = core.getInput("docker_image") || "public.ecr.aws/f9o7b7m0/roc";
 
     // ── Inline policy YAML ────────────────────────────────────────────────
-    // Convert action inputs to the inline policy YAML format and pass it to
-    // the container as --policy-file. This enables open-source use without
-    // needing an O3 Security dashboard account.
+    // Convert action inputs to the inline policy YAML and pass to the container.
     let policyFileArg = [];
     const hasInlinePolicy = Boolean(policy !== "audit" || allowedDomains || allowedIPs || allowedCIDRs);
     if (hasInlinePolicy) {
       const parseLine = (raw) =>
         raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
-
       const policyYAML = buildPolicyYAML(policy, parseLine(allowedDomains), parseLine(allowedIPs), parseLine(allowedCIDRs));
       const policyPath = "/tmp/roc-inline-policy.yaml";
       await fs.writeFile(policyPath, policyYAML, "utf8");
@@ -96,21 +93,20 @@ async function run() {
       "-m", "text",
     ];
 
-    // Add API credentials if provided (optional when using inline policy)
+    // Add API credentials if provided
     if (apiKey) dockerArgs.push("--api-key", apiKey);
     if (serverUrl) dockerArgs.push("--server-url", serverUrl);
     if (projectName) dockerArgs.push("--project", projectName);
 
-    // Inline policy file (generated from action inputs above)
+    // Inline policy file
     dockerArgs.push(...policyFileArg);
 
+    // Secret scanning patterns
     if (patterns) dockerArgs.push("--pattern", await resolvePatterns(patterns));
 
-    // File integrity monitoring — pass workspace so dpi knows what to watch
+    // File integrity monitoring
     const workspace = process.env.GITHUB_WORKSPACE;
     if (workspace) dockerArgs.push("--workspace", workspace);
-
-    // FIM event log (post.js reads, uploads to backend + Step Summary)
     dockerArgs.push("--fim-log", "/tmp/roc-fim-events.jsonl");
 
     // Egress log for automated baseline (post.js reads this)
@@ -139,21 +135,46 @@ async function run() {
     core.saveState("rocPid", rocProcess.pid.toString());
     core.saveState("dockerImage", dockerImage);
     core.saveState("egressPolicy", policy);
+    core.saveState("serverUrl", serverUrl);
     core.setOutput("roc_pid", rocProcess.pid.toString());
 
     // ── Health check ──────────────────────────────────────────────────────
-    await sleep(3000);
+    // Wait longer to account for image pull time on first run
+    await sleep(8000);
     try {
-      const cid = execSync(
+      // Check running first, then exited (container may have crashed immediately)
+      let cid = execSync(
         `sudo docker ps --filter "ancestor=${dockerImage}" --filter "status=running" --format "{{.ID}}" | head -1`,
         { encoding: "utf8" }
       ).trim();
+
       if (!cid) {
-        const stderr = await fs.readFile("/tmp/roc-stderr.log", "utf8").catch(() => "(no output)");
-        core.warning(`ROC container may not be running. stderr:\n${stderr}`);
-      } else {
-        core.info(`✅ ROC container running (ID: ${cid})`);
+        // Grab it even if exited — we still want containerId for logs
+        cid = execSync(
+          `sudo docker ps -a --filter "ancestor=${dockerImage}" --format "{{.ID}}" | head -1`,
+          { encoding: "utf8" }
+        ).trim();
+      }
+
+      if (cid) {
         core.saveState("containerId", cid);
+        // Check actual status
+        const status = execSync(
+          `sudo docker inspect --format='{{.State.Status}} (exit={{.State.ExitCode}})' ${cid} 2>/dev/null`,
+          { encoding: "utf8" }
+        ).trim();
+        if (status.includes("running")) {
+          core.info(`✅ ROC container running (ID: ${cid})`);
+        } else {
+          core.warning(`⚠️ ROC container exited (${status}) — printing docker logs:`);
+          try {
+            const dkLogs = execSync(`sudo docker logs ${cid} 2>&1`, { encoding: "utf8" });
+            core.warning(dkLogs || "(no container output)");
+          } catch (_) { }
+        }
+      } else {
+        const stderr = await fs.readFile("/tmp/roc-stderr.log", "utf8").catch(() => "(no output)");
+        core.warning(`ROC container not found. stderr:\n${stderr}`);
       }
     } catch (e) {
       core.warning(`Could not verify container status: ${e.message}`);

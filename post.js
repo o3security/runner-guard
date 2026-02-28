@@ -73,7 +73,7 @@ async function readFIMEvents() {
 
 async function uploadFIMEvents(events, apiKey, serverUrl) {
   if (!apiKey || events.length === 0) return;
-  const base = serverUrl || "https://app.o3security.io";
+  const base = (serverUrl || "https://api.codexsecurity.io").replace(/\/graphql\/?$/, '');
   try {
     await axios.post(`${base}/api/v1/roc/fim/events`, {
       repo: process.env.GITHUB_REPOSITORY || "",
@@ -140,28 +140,34 @@ ${(stats.blocked_details || []).map(b =>
   // Automated baseline section
   let baselineSection = "";
   if (baselineReport) {
-    if (baselineReport.firstRun) {
+    // Normalise field names — backend path and cache-only path use different keys
+    const newDests = baselineReport.newDestinations ?? [];
+    const knownDests = baselineReport.knownDestinations ?? baselineReport.egressClassified?.map(e => e.key) ?? [];
+    const runCount = baselineReport.runs ?? baselineReport.run_count ?? 1;
+    const isFirstRun = baselineReport.firstRun ?? (runCount === 1 && newDests.length === 0);
+
+    if (isFirstRun) {
       baselineSection = `
 ### 📊 Egress Baseline
 
-> **First run** — establishing baseline with ${Object.keys(baselineReport.knownDestinations).length} destinations observed.  
+> **First run** — establishing baseline with ${knownDests.length} destinations observed.  
 > Future runs will flag any **new** outbound connections not seen today.
 `;
     } else {
-      const newRows = baselineReport.newDestinations.length > 0
-        ? baselineReport.newDestinations.map(d => `| \`${d}\` | ⚠️ NEW |`).join("\n")
+      const newRows = newDests.length > 0
+        ? newDests.map(d => `| \`${d}\` | ⚠️ NEW |`).join("\n")
         : "| *(none)* | ✅ |";
-      if (baselineReport.newDestinations.length > 0) {
+      if (newDests.length > 0) {
         alertIcon = alertIcon === "✅" ? "⚠️" : alertIcon;
       }
       baselineSection = `
-### 📊 Egress Baseline (run #${baselineReport.runs})
+### 📊 Egress Baseline (run #${runCount})
 
 | Destination | Status |
 |-------------|--------|
 ${newRows}
 
-**Known destinations:** ${baselineReport.knownDestinations.length} &nbsp; **Baseline size:** ${baselineReport.totalKnown}
+**Known destinations:** ${knownDests.length}
 `;
     }
   }
@@ -188,7 +194,7 @@ ${rows}${more}
   const uniqueDests = stats ? (stats.unique_destinations || 0) : "–";
   const blockedCount = stats ? (stats.blocked_connections || 0) : "–";
 
-  const serverUrl = core.getState("serverUrl") || "https://app.o3security.io";
+  const serverUrl = core.getState("serverUrl") || "https://api.codexsecurity.io";
   const dashboardUrl = `${serverUrl}/projects`;
 
   const md = `
@@ -230,7 +236,7 @@ async function cleanup() {
   const egressPolicy = core.getState("egressPolicy") || "audit";
   const containerId = core.getState("containerId") || "";
   const apiKey = core.getInput("api_key") || "";
-  const serverUrl = core.getState("serverUrl") || "https://app.o3security.io";
+  const serverUrl = core.getState("serverUrl") || "https://api.codexsecurity.io";
 
   core.info("O3 Security ROC Agent: stopping monitor and collecting results...");
 
@@ -251,9 +257,56 @@ async function cleanup() {
     core.warning(`Error during ROC stop: ${e.message}`);
   }
 
-  // 3. Read logs
-  await readLog("stdout", "/tmp/roc-stdout.log");
-  await readLog("stderr", "/tmp/roc-stderr.log");
+  // 3. Full diagnostics — always print so failures are visible
+  core.info("════════════════════════════════════════");
+  core.info("ROC AGENT DIAGNOSTICS");
+  core.info("════════════════════════════════════════");
+  core.info(`containerId state: "${containerId || '(none)'}"`);
+  core.info(`rocPid state: "${core.getState("rocPid") || '(none)'}"`);
+  core.info(`serverUrl: "${serverUrl}"`);
+  core.info(`egressPolicy: "${egressPolicy}"`);
+
+  // Docker container status
+  try {
+    const psOut = execSync("sudo docker ps -a --format 'table {{.ID}}\\t{{.Image}}\\t{{.Status}}\\t{{.Names}}' 2>&1", { encoding: "utf8" });
+    core.info("── docker ps -a ──");
+    core.info(psOut || "(empty)");
+  } catch (e) { core.info(`docker ps error: ${e.message}`); }
+
+  // Docker logs from our container
+  if (containerId) {
+    try {
+      const dockerLogs = execSync(`sudo docker logs --tail 100 ${containerId} 2>&1`, { encoding: "utf8" });
+      core.info(`── docker logs (${containerId}) ──`);
+      core.info(dockerLogs || "(empty)");
+    } catch (e) { core.info(`docker logs error: ${e.message}`); }
+  }
+
+  // All ROC /tmp files
+  const tmpFiles = [
+    "/tmp/roc-stdout.log",
+    "/tmp/roc-stderr.log",
+    "/tmp/roc-egress-log.jsonl",
+    "/tmp/roc-fim-events.jsonl",
+    "/tmp/roc-summary.json",
+    "/tmp/roc-inline-policy.yaml",
+    "/tmp/roc-inline-patterns.yaml",
+    "/tmp/roc-step-context.json",
+  ];
+  for (const f of tmpFiles) {
+    try {
+      if (await fs.pathExists(f)) {
+        const content = await fs.readFile(f, "utf8");
+        const lines = content.trim().split("\n").length;
+        core.info(`── ${f} (${content.length} bytes, ${lines} lines) ──`);
+        core.info(content.trim() || "(empty)");
+      } else {
+        core.info(`── ${f}: NOT FOUND`);
+      }
+    } catch (e) { core.info(`── ${f}: read error: ${e.message}`); }
+  }
+  core.info("════════════════════════════════════════");
+
 
   // 4. Read FIM events + upload to backend
   const fimEvents = await readFIMEvents();
