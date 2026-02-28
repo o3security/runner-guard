@@ -1,6 +1,354 @@
 /******/ (() => { // webpackBootstrap
 /******/ 	var __webpack_modules__ = ({
 
+/***/ 9421:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+// baseline.js — ROC Agent baseline analysis + severity classification
+//
+// Runs in post.js at job-end. Reads egress JSONL and FIM JSONL produced by
+// the dpi container, classifies each observation with severity, then sends
+// the full enriched payload to POST /api/v1/roc/ingest.
+//
+// Phase 3 heuristics (ZERO external APIs):
+//   - Known-registry list (50+ entries) → info
+//   - Raw IP (net.isIP) → critical
+//   - Private/RFC1918 IP → high
+//   - TLS cert NotBefore < 14 days → high (extracted from egress JSONL)
+//   - DNS TTL < 60s → high (dns.resolve from runner)
+//   - FIM source file during install step → high
+
+const core = __nccwpck_require__(7484);
+const cache = __nccwpck_require__(2167);
+const fs = __nccwpck_require__(2136);
+const dns = (__nccwpck_require__(2250).promises);
+const net = __nccwpck_require__(9278);
+const { default: axios } = __nccwpck_require__(1473);
+
+const EGRESS_LOG_PATH = '/tmp/roc-egress-log.jsonl';
+const FIM_LOG_PATH = '/tmp/roc-fim-events.jsonl';
+const BASELINE_CACHE_PATH = '/tmp/roc-baseline-cache.json';
+
+// ─── Known-safe registries + CDNs (auto-downgrade to "info") ──────────────────
+
+const KNOWN_REGISTRIES = new Set([
+    // Package registries
+    'registry.npmjs.org', 'registry.yarnpkg.com',
+    'pypi.org', 'files.pythonhosted.org',
+    'crates.io', 'static.crates.io',
+    'pkg.go.dev', 'sum.golang.org', 'proxy.golang.org', 'storage.googleapis.com',
+    'repo1.maven.org', 'central.maven.org', 'plugins.gradle.org',
+    'nuget.org', 'api.nuget.org',
+    'rubygems.org', 'index.rubygems.org',
+    'packagist.org',
+    'deb.debian.org', 'security.debian.org', 'archive.ubuntu.com',
+    // GitHub & CDNs
+    'github.com', 'api.github.com', 'raw.githubusercontent.com',
+    'objects.githubusercontent.com', 'codeload.github.com',
+    'uploads.github.com', 'ghcr.io',
+    // Docker
+    'registry-1.docker.io', 'auth.docker.io', 'registry.docker.io',
+    'production.cloudflare.docker.com', 'index.docker.io',
+    // CDNs
+    'cloudflare.com', 'unpkg.com', 'cdn.jsdelivr.net',
+    'fastly.net', 'akamaized.net', 'akamai.net', 'edgekey.net',
+    'amazonaws.com', 's3.amazonaws.com',
+    // CI infrastructure
+    'actions-results-receiver-production.githubapp.com',
+    'pipelines.actions.githubusercontent.com',
+    'results-receiver.actions.githubusercontent.com',
+    'api.snapcraft.io',
+]);
+
+// Domain suffix check (e.g. foo.pypi.org)
+const KNOWN_SUFFIXES = [
+    '.npmjs.org', '.npmjs.com', '.yarnpkg.com',
+    '.pypi.org', '.pythonhosted.org',
+    '.crates.io', '.golang.org', '.googleapis.com',
+    '.maven.org', '.gradle.org', '.nuget.org',
+    '.rubygems.org', '.packagist.org',
+    '.debian.org', '.ubuntu.com',
+    '.github.com', '.githubusercontent.com', '.ghcr.io',
+    '.docker.io', '.docker.com',
+    '.cloudflare.com', '.unpkg.com', '.jsdelivr.net',
+    '.fastly.net', '.akamaized.net', '.akamai.net',
+    '.amazonaws.com', '.s3.amazonaws.com',
+    '.actions.githubusercontent.com', '.githubapp.com',
+];
+
+function isKnownRegistry(domain) {
+    if (!domain) return false;
+    if (KNOWN_REGISTRIES.has(domain)) return true;
+    return KNOWN_SUFFIXES.some(s => domain.endsWith(s));
+}
+
+// ─── IP classification ────────────────────────────────────────────────────────
+
+function isRawIP(str) {
+    return net.isIP(str) !== 0;
+}
+
+function isPrivateIP(ip) {
+    if (!ip || net.isIP(ip) === 0) return false;
+    return (
+        ip.startsWith('10.') ||
+        ip.startsWith('127.') ||
+        ip.startsWith('169.254.') ||
+        ip.startsWith('::1') ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
+        ip.startsWith('192.168.')
+    );
+}
+
+// ─── DNS TTL check ────────────────────────────────────────────────────────────
+
+async function getDNSTTL(domain) {
+    try {
+        // dns.resolve4 returns [{address, ttl}] with ttl option
+        const records = await dns.resolve4(domain, { ttl: true });
+        if (records && records.length > 0) return records[0].ttl;
+    } catch { /* NXDOMAIN or timeout */ }
+    return null;
+}
+
+// ─── TLS cert age check ───────────────────────────────────────────────────────
+
+function certAgeDays(notBeforeIso) {
+    if (!notBeforeIso) return null;
+    try {
+        const d = new Date(notBeforeIso);
+        return Math.floor((Date.now() - d.getTime()) / 86_400_000);
+    } catch { return null; }
+}
+
+// ─── Egress severity classifier ───────────────────────────────────────────────
+
+async function classifyEgress(entry) {
+    const domain = (entry.domain || entry.host || '').toLowerCase().replace(/\.$/, '');
+    const ip = entry.ip || '';
+
+    // Raw IP → critical (unless private)
+    if (!domain && ip) {
+        if (isPrivateIP(ip)) return { severity: 'high', severity_reason: 'private_ip' };
+        return { severity: 'critical', severity_reason: 'raw_ip' };
+    }
+    if (domain && isRawIP(domain)) {
+        if (isPrivateIP(domain)) return { severity: 'high', severity_reason: 'private_ip' };
+        return { severity: 'critical', severity_reason: 'raw_ip' };
+    }
+
+    // Known registry → info
+    if (domain && isKnownRegistry(domain)) {
+        return { severity: 'info', severity_reason: 'known_registry' };
+    }
+
+    // TLS cert issued recently → high
+    if (entry.tls_cert_not_before) {
+        const ageDays = certAgeDays(entry.tls_cert_not_before);
+        if (ageDays !== null && ageDays < 14) {
+            return { severity: 'high', severity_reason: 'new_tls_cert', cert_age_days: ageDays };
+        }
+    }
+
+    // DNS TTL very low → suspicious (likely fast-flux or newly spun up)
+    if (domain) {
+        const ttl = await getDNSTTL(domain);
+        if (ttl !== null && ttl < 60) {
+            return { severity: 'high', severity_reason: 'low_dns_ttl', dns_ttl: ttl };
+        }
+    }
+
+    // Default: unknown public domain
+    return { severity: 'medium', severity_reason: 'unknown_domain' };
+}
+
+// ─── FIM severity classifier ──────────────────────────────────────────────────
+
+function classifyFIM(event) {
+    const path = (event.path || '').toLowerCase();
+    const step = (event.step_name || '').toLowerCase();
+    const action = (event.action || '').toUpperCase();
+
+    const isInstallStep = /npm install|pip install|yarn install|go mod|bundle install|apt-get|apt install/i.test(step);
+    const isSourceFile = /\.(js|ts|jsx|tsx|py|go|java|rb|sh|bash)$/.test(path);
+    const isLockFile = /\.(lock|sum)$|package-lock\.json|yarn\.lock|pipfile\.lock/i.test(path);
+    const isConfigFile = /\.(yaml|yml|toml|json)$/.test(path);
+    const isBuildArtifact = /^\/(dist|build|target|__pycache__|\.venv)\//.test('/' + path.split('/').slice(1).join('/'));
+
+    if (isBuildArtifact) return { severity: 'low', severity_reason: 'build_artifact' };
+    if (isSourceFile && isInstallStep) return { severity: 'high', severity_reason: 'source_during_install' };
+    if (isSourceFile && action === 'MODIFIED') return { severity: 'high', severity_reason: 'source_modified' };
+    if (isLockFile && isInstallStep) return { severity: 'medium', severity_reason: 'lockfile_during_install' };
+    if (isLockFile) return { severity: 'medium', severity_reason: 'lockfile_modified' };
+    if (isConfigFile && isInstallStep) return { severity: 'high', severity_reason: 'config_during_install' };
+    return { severity: 'medium', severity_reason: 'file_modified' };
+}
+
+// ─── Log readers ──────────────────────────────────────────────────────────────
+
+async function readJSONL(path) {
+    try {
+        if (!(await fs.pathExists(path))) return [];
+        const content = await fs.readFile(path, 'utf8');
+        const results = [];
+        for (const line of content.split('\n')) {
+            const t = line.trim();
+            if (!t) continue;
+            try { results.push(JSON.parse(t)); } catch { /* skip */ }
+        }
+        return results;
+    } catch { return []; }
+}
+
+// ─── Cache fallback (when no api_key) ────────────────────────────────────────
+
+function baselineCacheKey() {
+    const job = process.env.GITHUB_JOB || 'default';
+    const ref = (process.env.GITHUB_REF_NAME || 'main').replace(/[^a-zA-Z0-9_-]/g, '-');
+    return `roc-baseline-${job}-${ref}`;
+}
+
+async function loadFromCache() {
+    try {
+        const hit = await cache.restoreCache([BASELINE_CACHE_PATH], baselineCacheKey());
+        if (!hit) return null;
+        return await fs.readJson(BASELINE_CACHE_PATH);
+    } catch { return null; }
+}
+
+async function saveToCache(data) {
+    try {
+        await fs.writeJson(BASELINE_CACHE_PATH, data, { spaces: 2 });
+        await cache.saveCache([BASELINE_CACHE_PATH], `${baselineCacheKey()}-${Date.now()}`);
+    } catch (e) { core.warning(`[Baseline] Cache save failed: ${e.message}`); }
+}
+
+// ─── Simple cache-only baseline (no api_key) ─────────────────────────────────
+
+async function runCacheOnlyBaseline(egressRaw) {
+    const existing = await loadFromCache();
+    const currentKeys = Object.fromEntries(
+        egressRaw.map(e => [`${e.domain || e.ip || 'unknown'}:${e.port || 443}`, 1])
+    );
+
+    const newDestinations = [];
+    const baseline = existing?.baseline || {};
+    for (const key of Object.keys(currentKeys)) {
+        if (!baseline[key]) newDestinations.push(key);
+        baseline[key] = (baseline[key] || 0) + 1;
+    }
+
+    const runs = (existing?.runs || 0) + 1;
+    const firstRun = !existing;
+    await saveToCache({ runs, baseline, updated_at: new Date().toISOString() });
+
+    return { firstRun, newDestinations, knownDestinations: Object.keys(baseline), runs, storedIn: 'cache' };
+}
+
+// ─── Main ingest (api_key present) ───────────────────────────────────────────
+
+async function runIngest(apiKey, serverUrl) {
+    const base = serverUrl || 'https://app.o3security.io';
+    const repo = process.env.GITHUB_REPOSITORY || '';
+    const job = process.env.GITHUB_JOB || 'default';
+    const branch = process.env.GITHUB_REF_NAME || process.env.GITHUB_REF || 'main';
+    const run_id = process.env.GITHUB_RUN_ID || String(Date.now());
+    const run_number = process.env.GITHUB_RUN_NUMBER || null;
+    const workflow = process.env.GITHUB_WORKFLOW || '';
+
+    // Read raw logs
+    const [egressRaw, fimRaw] = await Promise.all([
+        readJSONL(EGRESS_LOG_PATH),
+        readJSONL(FIM_LOG_PATH),
+    ]);
+
+    core.info(`[Baseline] ${egressRaw.length} egress connections, ${fimRaw.length} FIM events to process`);
+
+    // Classify egress — run DNS checks in parallel (capped at 20 to avoid slowdown)
+    const egressToCheck = egressRaw.slice(0, 100);
+    const egressClassified = await Promise.all(
+        egressToCheck.map(async (e) => {
+            const domain = (e.domain || e.host || e.ip || 'unknown').toLowerCase();
+            const port = e.port || 443;
+            const key = `${domain}:${port}`;
+            const { severity, severity_reason, ...extra } = await classifyEgress(e);
+            return { key, severity, severity_reason, tls_cert_not_before: e.tls_cert_not_before || null, ...extra };
+        })
+    );
+
+    // Classify FIM
+    const fimClassified = fimRaw.map(e => {
+        const { severity, severity_reason } = classifyFIM(e);
+        const key = `${e.path || 'unknown'}::${e.step_name || 'unknown'}`;
+        return {
+            key, severity, severity_reason,
+            sha256: e.sha256 || null,
+            before_sha256: e.before_sha256 || null,
+        };
+    });
+
+    // Send to backend
+    try {
+        const resp = await axios.post(`${base}/api/v1/roc/ingest`, {
+            repo, job, branch, run_id, run_number, workflow,
+            egress: egressClassified,
+            fim_events: fimClassified,
+        }, {
+            headers: { Authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },
+            timeout: 20000,
+        });
+
+        const result = resp.data;
+        core.info(`[Baseline] Ingested: phase=${result.phase}, run #${result.run_count}, ${result.deviations} deviation(s)`);
+
+        const highCritical = result.high_severity_deviations || [];
+        if (highCritical.length > 0) {
+            core.warning(`[Baseline] ⚠️  ${highCritical.length} HIGH/CRITICAL deviation(s): ${highCritical.map(d => d.key).join(', ')}`);
+        }
+
+        // Also save to cache as local backup
+        const cacheData = { runs: result.run_count, baseline: Object.fromEntries(egressClassified.map(e => [e.key, 1])), updated_at: new Date().toISOString() };
+        await saveToCache(cacheData);
+
+        return {
+            phase: result.phase,
+            deviations: result.deviations,
+            high_severity_deviations: highCritical,
+            run_count: result.run_count,
+            egressClassified,
+            fimClassified,
+            storedIn: 'backend+cache',
+        };
+    } catch (e) {
+        core.warning(`[Baseline] Backend ingest failed (${e.message}), falling back to cache-only`);
+        return runCacheOnlyBaseline(egressRaw);
+    }
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
+async function runBaselineAnalysis(apiKey, serverUrl) {
+    if (apiKey) {
+        return runIngest(apiKey, serverUrl);
+    }
+    // Cache-only (no api_key)
+    const egressRaw = await readJSONL(EGRESS_LOG_PATH);
+    return runCacheOnlyBaseline(egressRaw);
+}
+
+module.exports = {
+    runBaselineAnalysis,
+    classifyEgress,
+    classifyFIM,
+    isKnownRegistry,
+    isPrivateIP,
+    isRawIP,
+    readJSONL,
+};
+
+
+/***/ }),
+
 /***/ 4914:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -28415,6 +28763,22 @@ exports.fromPromise = function (fn) {
 
 /***/ }),
 
+/***/ 2167:
+/***/ ((module) => {
+
+module.exports = eval("require")("@actions/cache");
+
+
+/***/ }),
+
+/***/ 1473:
+/***/ ((module) => {
+
+module.exports = eval("require")("axios");
+
+
+/***/ }),
+
 /***/ 2613:
 /***/ ((module) => {
 
@@ -28476,6 +28840,14 @@ module.exports = require("crypto");
 
 "use strict";
 module.exports = require("diagnostics_channel");
+
+/***/ }),
+
+/***/ 2250:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("dns");
 
 /***/ }),
 
@@ -30338,40 +30710,300 @@ var __webpack_exports__ = {};
 const core = __nccwpck_require__(7484);
 const exec = __nccwpck_require__(5236);
 const fs = __nccwpck_require__(2136);
+const { execSync } = __nccwpck_require__(5317);
+const axios = __nccwpck_require__(1473);
+const { runBaselineAnalysis } = __nccwpck_require__(9421);
 
-async function readAndLog(logType, logPath) {
+const FIM_LOG_PATH = "/tmp/roc-fim-events.jsonl";
+
+// ----------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------
+async function readLog(logType, logPath) {
   try {
     if (await fs.pathExists(logPath)) {
-      core.info(`--- ROC ${logType} ---`);
-      const logContent = await fs.readFile(logPath, "utf8");
-      core.info(logContent);
-      core.info(`--- End ROC ${logType} ---`);
-    } else {
-      core.info(`ROC ${logType} log file not found at ${logPath}`);
+      const content = await fs.readFile(logPath, "utf8");
+      if (content.trim()) {
+        core.info(`--- ROC ${logType} ---`);
+        core.info(content);
+        core.info(`--- End ROC ${logType} ---`);
+      }
+      return content;
     }
-  } catch (error) {
-    core.warning(`Error reading ROC ${logType} log: ${error.message}`);
+  } catch (e) {
+    core.warning(`Error reading ROC ${logType}: ${e.message}`);
+  }
+  return "";
+}
+
+async function readSummaryStats() {
+  try {
+    if (await fs.pathExists("/tmp/roc-summary.json")) {
+      return await fs.readJson("/tmp/roc-summary.json");
+    }
+  } catch (e) {
+    core.debug(`Could not read roc-summary.json: ${e.message}`);
+  }
+  return null;
+}
+
+async function getContainerStats(containerId) {
+  if (!containerId) return null;
+  try {
+    const out = execSync(
+      `sudo docker inspect --format='{{json .State}}' ${containerId} 2>/dev/null`,
+      { encoding: "utf8" }
+    ).trim();
+    return JSON.parse(out);
+  } catch (_) {
+    return null;
   }
 }
 
-async function cleanup() {
+// ----------------------------------------------------------------
+// FIM event reader + uploader
+// ----------------------------------------------------------------
+async function readFIMEvents() {
   try {
-    await readAndLog("stdout", "/tmp/roc-stdout.log");
-    await readAndLog("stderr", "/tmp/roc-stderr.log");
+    if (!(await fs.pathExists(FIM_LOG_PATH))) return [];
+    const content = await fs.readFile(FIM_LOG_PATH, "utf8");
+    const events = [];
+    for (const line of content.split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try { events.push(JSON.parse(t)); } catch { /* skip malformed */ }
+    }
+    return events;
+  } catch (e) {
+    core.warning(`[FIM] Error reading fim-events log: ${e.message}`);
+    return [];
+  }
+}
 
+async function uploadFIMEvents(events, apiKey, serverUrl) {
+  if (!apiKey || events.length === 0) return;
+  const base = serverUrl || "https://app.o3security.io";
+  try {
+    await axios.post(`${base}/api/v1/roc/fim/events`, {
+      repo: process.env.GITHUB_REPOSITORY || "",
+      runId: process.env.GITHUB_RUN_ID || "",
+      job: process.env.GITHUB_JOB || "",
+      branch: process.env.GITHUB_REF_NAME || "",
+      events,
+    }, {
+      headers: { Authorization: `apiKey ${apiKey}`, "Content-Type": "application/json" },
+      timeout: 15000,
+    });
+    core.info(`[FIM] ✅ Uploaded ${events.length} FIM event(s) to backend`);
+  } catch (e) {
+    core.warning(`[FIM] Could not upload events to backend: ${e.message}`);
+  }
+}
+
+// ----------------------------------------------------------------
+// GitHub Step Summary writer
+// ----------------------------------------------------------------
+async function writeStepSummary(stats, egressPolicy, containerId, baselineReport, fimEvents) {
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (!summaryPath) {
+    core.debug("GITHUB_STEP_SUMMARY not set, skipping summary write.");
+    return;
+  }
+
+  const repo = process.env.GITHUB_REPOSITORY || "unknown";
+  const runId = process.env.GITHUB_RUN_ID || "";
+  const job = process.env.GITHUB_JOB || "";
+  const workflow = process.env.GITHUB_WORKFLOW || "";
+
+  let secretSection = "";
+  let alertIcon = "✅";
+
+  if (stats && stats.secrets_found > 0) {
+    alertIcon = "🚨";
+    secretSection = `
+### 🚨 Secrets Detected in Network Traffic
+
+| Pattern | Destination | Step |
+|---------|-------------|------|
+${(stats.secret_details || []).map(s =>
+      `| \`${s.pattern || "regex"}\` | \`${s.destination || "unknown"}\` | ${s.step || "-"} |`
+    ).join("\n")}
+
+> **Action Required:** Rotate the above credentials immediately.
+`;
+  }
+
+  let egressSection = "";
+  if (stats && stats.blocked_connections > 0) {
+    egressSection = `
+### 🚫 Blocked Egress Connections (${stats.blocked_connections})
+
+| Destination | Port | Step |
+|-------------|------|------|
+${(stats.blocked_details || []).map(b =>
+      `| \`${b.host || b.ip}\` | ${b.port} | ${b.step || "-"} |`
+    ).join("\n")}
+`;
+  }
+
+  // Automated baseline section
+  let baselineSection = "";
+  if (baselineReport) {
+    if (baselineReport.firstRun) {
+      baselineSection = `
+### 📊 Egress Baseline
+
+> **First run** — establishing baseline with ${Object.keys(baselineReport.knownDestinations).length} destinations observed.  
+> Future runs will flag any **new** outbound connections not seen today.
+`;
+    } else {
+      const newRows = baselineReport.newDestinations.length > 0
+        ? baselineReport.newDestinations.map(d => `| \`${d}\` | ⚠️ NEW |`).join("\n")
+        : "| *(none)* | ✅ |";
+      if (baselineReport.newDestinations.length > 0) {
+        alertIcon = alertIcon === "✅" ? "⚠️" : alertIcon;
+      }
+      baselineSection = `
+### 📊 Egress Baseline (run #${baselineReport.runs})
+
+| Destination | Status |
+|-------------|--------|
+${newRows}
+
+**Known destinations:** ${baselineReport.knownDestinations.length} &nbsp; **Baseline size:** ${baselineReport.totalKnown}
+`;
+    }
+  }
+
+  // FIM violations section
+  let fimSection = "";
+  if (fimEvents && fimEvents.length > 0) {
+    alertIcon = alertIcon === "✅" ? "🔍" : alertIcon;
+    const rows = fimEvents.slice(0, 20).map(e =>
+      `| \`${e.path || "-"}\` | ${e.action || "?"} | ${e.step_name || "-"} | \`${(e.sha256 || "").slice(0, 12)}…\` |`
+    ).join("\n");
+    const more = fimEvents.length > 20 ? `\n> _…and ${fimEvents.length - 20} more events_` : "";
+    fimSection = `
+### 🔍 File Integrity Violations (${fimEvents.length})
+
+| File | Action | Step | SHA256 (after) |
+|------|--------|------|----------------|
+${rows}${more}
+`;
+  }
+
+  const tlsCount = stats ? (stats.tls_connections || 0) : "–";
+  const secretsFound = stats ? (stats.secrets_found || 0) : "–";
+  const uniqueDests = stats ? (stats.unique_destinations || 0) : "–";
+  const blockedCount = stats ? (stats.blocked_connections || 0) : "–";
+
+  const serverUrl = core.getState("serverUrl") || "https://app.o3security.io";
+  const dashboardUrl = `${serverUrl}/projects`;
+
+  const md = `
+## ${alertIcon} O3 Security ROC Agent — Security Summary
+
+**Workflow:** \`${workflow}\` | **Job:** \`${job}\` | **Run:** [#${runId}](https://github.com/${repo}/actions/runs/${runId})
+
+| Metric | Value |
+|--------|-------|
+| TLS/SSL connections captured | **${tlsCount}** |
+| Secrets detected in traffic | **${secretsFound}** |
+| Unique egress destinations | **${uniqueDests}** |
+| Connections blocked | **${blockedCount}** |
+| FIM file violations | **${fimEvents ? fimEvents.length : "-"}** |
+| Egress policy | \`${egressPolicy || "audit"}\` |
+
+${secretSection}
+${egressSection}
+${fimSection}
+${baselineSection}
+---
+🛡️ Powered by [O3 Security ROC Agent](https://github.com/o3security/roc-agent)  
+[View full analysis →](${dashboardUrl})
+`;
+
+  try {
+    await fs.appendFile(summaryPath, md);
+    core.info("✅ Security summary written to GitHub Step Summary.");
+  } catch (e) {
+    core.warning(`Could not write Step Summary: ${e.message}`);
+  }
+}
+
+
+// ----------------------------------------------------------------
+// Main cleanup
+// ----------------------------------------------------------------
+async function cleanup() {
+  const egressPolicy = core.getState("egressPolicy") || "audit";
+  const containerId = core.getState("containerId") || "";
+  const apiKey = core.getInput("api_key") || "";
+  const serverUrl = core.getState("serverUrl") || "https://app.o3security.io";
+
+  core.info("O3 Security ROC Agent: stopping monitor and collecting results...");
+
+  try {
+    // 1. Signal ROC binary to flush summary
     const rocPid = core.getState("rocPid");
     if (rocPid) {
-      core.info(`Stopping ROC process with PID: ${rocPid}`);
-      // Use sudo to ensure permissions to kill the process started with sudo
-      await exec.exec("sudo", ["kill", "-SIGINT", rocPid]);
-      core.info(`Successfully sent SIGINT to ROC process ${rocPid}.`);
-    } else {
-      core.info("No ROC PID found, skipping cleanup.");
+      core.info(`Sending SIGINT to ROC process PID: ${rocPid}`);
+      try { await exec.exec("sudo", ["kill", "-SIGINT", rocPid]); } catch (_) { }
+      await sleep(3000);
     }
-  } catch (error) {
-    // Don't fail the workflow if cleanup fails, just log it
-    core.warning(`Failed to stop ROC process: ${error.message}`);
+    // 2. Stop container
+    if (containerId) {
+      core.info(`Stopping ROC container: ${containerId}`);
+      try { await exec.exec("sudo", ["docker", "stop", "--time=5", containerId]); } catch (_) { }
+    }
+  } catch (e) {
+    core.warning(`Error during ROC stop: ${e.message}`);
   }
+
+  // 3. Read logs
+  await readLog("stdout", "/tmp/roc-stdout.log");
+  await readLog("stderr", "/tmp/roc-stderr.log");
+
+  // 4. Read FIM events + upload to backend
+  const fimEvents = await readFIMEvents();
+  if (fimEvents.length > 0) {
+    core.warning(`[FIM] ⚠️  ${fimEvents.length} file integrity violation(s) detected during build!`);
+    await uploadFIMEvents(fimEvents, apiKey, serverUrl);
+  }
+
+  // 5. Run automated baseline analysis (load → diff → save)
+  let baselineReport = null;
+  if (core.getInput("baseline_enabled") !== "false") {
+    try {
+      baselineReport = await runBaselineAnalysis(apiKey, serverUrl);
+      if (baselineReport.newDestinations.length > 0) {
+        core.warning(
+          `[Baseline] ⚠️  ${baselineReport.newDestinations.length} new egress destination(s): ` +
+          baselineReport.newDestinations.join(", ")
+        );
+      } else if (!baselineReport.firstRun) {
+        core.info("[Baseline] ✅ All egress matches baseline — no new connections");
+      }
+    } catch (e) {
+      core.warning(`[Baseline] Analysis failed (non-fatal): ${e.message}`);
+    }
+  }
+
+  // 6. Read stats + write GitHub Step Summary
+  const stats = await readSummaryStats();
+  await writeStepSummary(stats, egressPolicy, containerId, baselineReport, fimEvents);
+
+  // 7. Warn on secrets
+  if (stats && stats.secrets_found > 0) {
+    core.warning(
+      `🚨 O3 Security: ${stats.secrets_found} secret(s) detected in network traffic. ` +
+      "Review the Step Summary above and rotate affected credentials."
+    );
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 cleanup();
