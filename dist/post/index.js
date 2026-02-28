@@ -40029,9 +40029,56 @@ async function cleanup() {
     core.warning(`Error during ROC stop: ${e.message}`);
   }
 
-  // 3. Read logs
-  await readLog("stdout", "/tmp/roc-stdout.log");
-  await readLog("stderr", "/tmp/roc-stderr.log");
+  // 3. Full diagnostics — always print so failures are visible
+  core.info("════════════════════════════════════════");
+  core.info("ROC AGENT DIAGNOSTICS");
+  core.info("════════════════════════════════════════");
+  core.info(`containerId state: "${containerId || '(none)'}"`);
+  core.info(`rocPid state: "${core.getState("rocPid") || '(none)'}"`);
+  core.info(`serverUrl: "${serverUrl}"`);
+  core.info(`egressPolicy: "${egressPolicy}"`);
+
+  // Docker container status
+  try {
+    const psOut = execSync("sudo docker ps -a --format 'table {{.ID}}\\t{{.Image}}\\t{{.Status}}\\t{{.Names}}' 2>&1", { encoding: "utf8" });
+    core.info("── docker ps -a ──");
+    core.info(psOut || "(empty)");
+  } catch (e) { core.info(`docker ps error: ${e.message}`); }
+
+  // Docker logs from our container
+  if (containerId) {
+    try {
+      const dockerLogs = execSync(`sudo docker logs --tail 100 ${containerId} 2>&1`, { encoding: "utf8" });
+      core.info(`── docker logs (${containerId}) ──`);
+      core.info(dockerLogs || "(empty)");
+    } catch (e) { core.info(`docker logs error: ${e.message}`); }
+  }
+
+  // All ROC /tmp files
+  const tmpFiles = [
+    "/tmp/roc-stdout.log",
+    "/tmp/roc-stderr.log",
+    "/tmp/roc-egress-log.jsonl",
+    "/tmp/roc-fim-events.jsonl",
+    "/tmp/roc-summary.json",
+    "/tmp/roc-inline-policy.yaml",
+    "/tmp/roc-inline-patterns.yaml",
+    "/tmp/roc-step-context.json",
+  ];
+  for (const f of tmpFiles) {
+    try {
+      if (await fs.pathExists(f)) {
+        const content = await fs.readFile(f, "utf8");
+        const lines = content.trim().split("\n").length;
+        core.info(`── ${f} (${content.length} bytes, ${lines} lines) ──`);
+        core.info(content.trim() || "(empty)");
+      } else {
+        core.info(`── ${f}: NOT FOUND`);
+      }
+    } catch (e) { core.info(`── ${f}: read error: ${e.message}`); }
+  }
+  core.info("════════════════════════════════════════");
+
 
   // 4. Read FIM events + upload to backend
   const fimEvents = await readFIMEvents();
