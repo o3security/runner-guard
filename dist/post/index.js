@@ -254,7 +254,7 @@ async function runCacheOnlyBaseline(egressRaw) {
 // ─── Main ingest (api_key present) ───────────────────────────────────────────
 
 async function runIngest(apiKey, serverUrl) {
-    const base = serverUrl || 'https://app.o3security.io';
+    const base = serverUrl || 'https://api.codexsecurity.io';
     const repo = process.env.GITHUB_REPOSITORY || '';
     const job = process.env.GITHUB_JOB || 'default';
     const branch = process.env.GITHUB_REF_NAME || process.env.GITHUB_REF || 'main';
@@ -39850,7 +39850,7 @@ async function readFIMEvents() {
 
 async function uploadFIMEvents(events, apiKey, serverUrl) {
   if (!apiKey || events.length === 0) return;
-  const base = serverUrl || "https://app.o3security.io";
+  const base = serverUrl || "https://api.codexsecurity.io";
   try {
     await axios.post(`${base}/api/v1/roc/fim/events`, {
       repo: process.env.GITHUB_REPOSITORY || "",
@@ -39965,7 +39965,7 @@ ${rows}${more}
   const uniqueDests = stats ? (stats.unique_destinations || 0) : "–";
   const blockedCount = stats ? (stats.blocked_connections || 0) : "–";
 
-  const serverUrl = core.getState("serverUrl") || "https://app.o3security.io";
+  const serverUrl = core.getState("serverUrl") || "https://api.codexsecurity.io";
   const dashboardUrl = `${serverUrl}/projects`;
 
   const md = `
@@ -40007,7 +40007,7 @@ async function cleanup() {
   const egressPolicy = core.getState("egressPolicy") || "audit";
   const containerId = core.getState("containerId") || "";
   const apiKey = core.getInput("api_key") || "";
-  const serverUrl = core.getState("serverUrl") || "https://app.o3security.io";
+  const serverUrl = core.getState("serverUrl") || "https://api.codexsecurity.io";
 
   core.info("O3 Security ROC Agent: stopping monitor and collecting results...");
 

@@ -248,7 +248,7 @@ async function runCacheOnlyBaseline(egressRaw) {
 // ─── Main ingest (api_key present) ───────────────────────────────────────────
 
 async function runIngest(apiKey, serverUrl) {
-    const base = serverUrl || 'https://app.o3security.io';
+    const base = serverUrl || 'https://api.codexsecurity.io';
     const repo = process.env.GITHUB_REPOSITORY || '';
     const job = process.env.GITHUB_JOB || 'default';
     const branch = process.env.GITHUB_REF_NAME || process.env.GITHUB_REF || 'main';

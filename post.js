@@ -73,7 +73,7 @@ async function readFIMEvents() {
 
 async function uploadFIMEvents(events, apiKey, serverUrl) {
   if (!apiKey || events.length === 0) return;
-  const base = serverUrl || "https://app.o3security.io";
+  const base = serverUrl || "https://api.codexsecurity.io";
   try {
     await axios.post(`${base}/api/v1/roc/fim/events`, {
       repo: process.env.GITHUB_REPOSITORY || "",
@@ -188,7 +188,7 @@ ${rows}${more}
   const uniqueDests = stats ? (stats.unique_destinations || 0) : "–";
   const blockedCount = stats ? (stats.blocked_connections || 0) : "–";
 
-  const serverUrl = core.getState("serverUrl") || "https://app.o3security.io";
+  const serverUrl = core.getState("serverUrl") || "https://api.codexsecurity.io";
   const dashboardUrl = `${serverUrl}/projects`;
 
   const md = `
@@ -230,7 +230,7 @@ async function cleanup() {
   const egressPolicy = core.getState("egressPolicy") || "audit";
   const containerId = core.getState("containerId") || "";
   const apiKey = core.getInput("api_key") || "";
-  const serverUrl = core.getState("serverUrl") || "https://app.o3security.io";
+  const serverUrl = core.getState("serverUrl") || "https://api.codexsecurity.io";
 
   core.info("O3 Security ROC Agent: stopping monitor and collecting results...");
 

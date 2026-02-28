@@ -30363,7 +30363,7 @@ async function run() {
 
     // ── Inputs ────────────────────────────────────────────────────────────
     const apiKey = core.getInput("api_key");
-    const serverUrl = core.getInput("server_url");
+    const serverUrl = core.getInput("server_url") || "https://api.codexsecurity.io";
     const projectName = core.getInput("project_name");
     // Inline policy (open-source / no-dashboard mode)
     const policy = core.getInput("policy") || "audit";
@@ -30476,6 +30476,7 @@ async function run() {
     core.saveState("rocPid", rocProcess.pid.toString());
     core.saveState("dockerImage", dockerImage);
     core.saveState("egressPolicy", policy);
+    core.saveState("serverUrl", serverUrl);
     core.setOutput("roc_pid", rocProcess.pid.toString());
 
     // ── Health check ──────────────────────────────────────────────────────
