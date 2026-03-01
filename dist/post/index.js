@@ -39928,44 +39928,15 @@ async function readFIMEvents() {
   }
 }
 
-async function uploadFIMEvents(events, apiKey, serverUrl) {
-  if (!apiKey || events.length === 0) return;
-  const base = (serverUrl || "https://api.codexsecurity.io").replace(/\/graphql\/?$/, '');
-  try {
-    await axios.post(`${base}/api/v1/roc/fim/events`, {
-      repo: process.env.GITHUB_REPOSITORY || "",
-      runId: process.env.GITHUB_RUN_ID || "",
-      job: process.env.GITHUB_JOB || "",
-      branch: process.env.GITHUB_REF_NAME || "",
-      events,
-    }, {
-      headers: { Authorization: `apiKey ${apiKey}`, "Content-Type": "application/json" },
-      timeout: 15000,
-    });
-    core.info(`[FIM] ✅ Uploaded ${events.length} FIM event(s) to backend`);
-  } catch (e) {
-    core.warning(`[FIM] Could not upload events to backend: ${e.message}`);
-  }
-}
 
 // ----------------------------------------------------------------
-// Parse step_name from DPI evidence string
-// Evidence looks like: "2026-03-01T06:13:22Z ##[group]Run echo \"Testing...\""
-// Returns the step name extracted from the ##[group]Run prefix, or null
-// ----------------------------------------------------------------
-function parseStepName(evidence) {
-  if (!evidence) return null;
-  // Match ##[group]Run <step text>
-  const m = evidence.match(/##\[group\]Run (.+?)(?:\n|$)/);
-  if (m) return m[1].trim().slice(0, 80);
-  return null;
-}
-
-// ----------------------------------------------------------------
-// Upload full pipeline security finding to backend
-// Called at job-end with all accumulated data.
+// Upload egress baseline deviations and FIM events to backend.
+// Secrets → Go binary via UploadTrafficRuntimeData (during job).
+// FIM     → Go binary via UploadFIMFindings (at SIGTERM shutdown).
+// post.js → only egress deviation baseline comparison remains here.
 // ----------------------------------------------------------------
 async function uploadPipelineVuln(apiKey, serverUrl, fimEvents, baselineReport, stats) {
+
   if (!apiKey) {
     core.info('[PipelineVuln] No API key — skipping');
     return;
@@ -39978,43 +39949,6 @@ async function uploadPipelineVuln(apiKey, serverUrl, fimEvents, baselineReport, 
       stepContext = await fs.readJson('/tmp/roc-step-context.json');
     }
   } catch (_) { /* non-fatal */ }
-
-  // ── Load pattern regexes for re-scanning secrets:true events ─────────────
-  // The roc binary writes secrets:true (boolean) — no matched text.
-  // We re-run the patterns ourselves on the available data (cmdline, domain, evidence snippets).
-  let loadedPatterns = [];
-  try {
-    const PATTERN_FILES = [
-      '/tmp/roc-inline-patterns.yaml',
-      '/tmp/roc-patterns.yaml',
-    ];
-    for (const pf of PATTERN_FILES) {
-      if (await fs.pathExists(pf)) {
-        const yaml = await fs.readFile(pf, 'utf8');
-        // Parse patterns: - id: foo\n  regex: 'bar'\n  severity: high
-        const patternMatches = [...yaml.matchAll(/[-]\s+id:\s*(\S+)[\s\S]*?regex:\s*['"]?([^'"\n]+)['"]?(?:[\s\S]*?severity:\s*(\S+))?/gm)];
-        for (const m of patternMatches) {
-          try {
-            loadedPatterns.push({ id: m[1], regex: new RegExp(m[2], 'g'), severity: (m[3] || 'high').replace(/[^a-z]/gi, '') });
-          } catch (_) { /* invalid regex, skip */ }
-        }
-        core.info(`[PipelineVuln] Loaded ${loadedPatterns.length} patterns from ${pf}`);
-        break;
-      }
-    }
-  } catch (e) {
-    core.debug(`[PipelineVuln] Could not load pattern file: ${e.message}`);
-  }
-
-  function scanForSecrets(text) {
-    if (!text || !loadedPatterns.length) return null;
-    for (const p of loadedPatterns) {
-      p.regex.lastIndex = 0;
-      const m = p.regex.exec(text);
-      if (m) return { pattern_id: p.id, matched_text: m[0], severity: p.severity };
-    }
-    return null;
-  }
 
   // ── Build egress deviations ───────────────────────────────────────────────
 
