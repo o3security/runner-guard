@@ -49,11 +49,26 @@ async function readSummaryStats() {
     const uniqueDests = new Set(events.map(e => { const d = e.domain || e.ip || ''; const p = e.port || 443; return `${d}:${p}`; }));
     const secretEvents = events.filter(e => e.secrets === true);
 
+    // Try to load step context (written by action.yml pre-step)
+    let stepContext = {};
+    try {
+      if (await fs.pathExists('/tmp/roc-step-context.json')) {
+        stepContext = await fs.readJson('/tmp/roc-step-context.json');
+      }
+    } catch (e) { /* non-fatal */ }
+
     return {
       tls_connections: events.filter(e => e.source !== 'tcpmonitor').length,
       unique_destinations: uniqueDests.size,
       secrets_found: secretEvents.length,
-      secret_details: secretEvents.map(e => ({ pattern: 'detected', destination: e.domain || e.ip, step: e.comm || '' })),
+      secret_details: secretEvents.map(e => ({
+        pattern: 'detected',
+        destination: e.domain || e.ip,
+        step: stepContext.step_name || e.comm || '',
+        comm: e.comm || '',
+        cmdline: e.cmdline || '',
+        parent_comm: e.parent_comm || '',
+      })),
       blocked_connections: 0,
       // Rich per-event data for the captures table
       egress_events: events.map(e => ({
@@ -151,11 +166,15 @@ async function writeStepSummary(stats, egressPolicy, containerId, baselineReport
     secretSection = `
 ### 🚨 Secrets Detected in Network Traffic
 
-| Pattern | Destination | Step |
-|---------|-------------|------|
-${(stats.secret_details || []).map(s =>
-      `| \`${s.pattern || "regex"}\` | \`${s.destination || "unknown"}\` | ${s.step || "-"} |`
-    ).join("\n")}
+| Pattern | Destination | Step | Process | Parent | Command |
+|---------|-------------|------|---------|--------|---------|
+${(stats.secret_details || []).map(s => {
+      const step = s.step || '-';
+      const proc = s.comm ? `\`${s.comm}\`` : '-';
+      const parent = s.parent_comm ? `\`${s.parent_comm}\`` : '-';
+      const cmd = s.cmdline ? `\`${s.cmdline.slice(0, 60)}\`` : '-';
+      return `| \`${s.pattern || 'regex'}\` | \`${s.destination || 'unknown'}\` | ${step} | ${proc} | ${parent} | ${cmd} |`;
+    }).join("\n")}
 
 > **Action Required:** Rotate the above credentials immediately.
 `;
