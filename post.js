@@ -3,7 +3,7 @@ const exec = require("@actions/exec");
 const fs = require("fs-extra");
 const { execSync } = require("child_process");
 const axios = require("axios");
-const { runBaselineAnalysis } = require("./baseline");
+// Note: baseline analysis is now done via IngestCIBaseline GraphQL mutation (no REST import needed)
 
 const FIM_LOG_PATH = "/tmp/roc-fim-events.jsonl";
 
@@ -646,18 +646,116 @@ async function cleanup() {
     // uploadPipelineVuln below will include fim_events as a fallback.
   }
 
-  // 5. Run automated baseline analysis (load → diff → save)
+  // 5. Run CI baseline analysis via GraphQL (IngestCIBaseline)
+  //    Sends all egress destinations + FIM events observed this run.
+  //    Backend tracks learning/active phase and creates deviation vulns.
   let baselineReport = null;
-  if (core.getInput("baseline_enabled") !== "false") {
+  if (core.getInput("baseline_enabled") !== "false" && apiKey) {
     try {
-      baselineReport = await runBaselineAnalysis(apiKey, serverUrl);
-      if (baselineReport.newDestinations.length > 0) {
-        core.warning(
-          `[Baseline] ⚠️  ${baselineReport.newDestinations.length} new egress destination(s): ` +
-          baselineReport.newDestinations.join(", ")
-        );
-      } else if (!baselineReport.firstRun) {
-        core.info("[Baseline] ✅ All egress matches baseline — no new connections");
+      const egressLog = "/tmp/roc-egress-log.jsonl";
+      const egressDestinations = [];
+      if (await fs.pathExists(egressLog)) {
+        const content = await fs.readFile(egressLog, "utf8");
+        for (const line of content.split("\n").filter(l => l.trim())) {
+          try {
+            const ev = JSON.parse(line);
+            if (ev.secrets === true) continue; // skip secret-only markers
+            const host = ev.domain || ev.ip || null;
+            const portStr = ev.port ? String(ev.port) : '443';
+            if (!host) continue;
+            egressDestinations.push({
+              key: `${host}:${portStr}`,
+              host,
+              port: portStr,
+              protocol: ev.protocol || 'tcp',
+              severity: ev.severity || 'info',
+              comm: ev.comm || null,
+              cmdline: ev.cmdline || null,
+              parent_comm: ev.parent_comm || null,
+              source: 'egress_interceptor',
+            });
+          } catch (_) { /* skip malformed */ }
+        }
+      }
+
+      // Also include binary-captured destinations from traffic_runtime_data
+      // (binary runs inside Docker, writes to API — not to host JSONL)
+      // For now we rely on egress-interceptor JSONL for host-side egress.
+      // When binary sends all flows (not just secret ones), this will auto-populate.
+
+      const fimObs = fimEvents.map(e => ({
+        key: e.path || e.filename || e.key || null,
+        path: e.path || e.filename || null,
+        event_type: e.event_type || e.type || 'write',
+        severity: e.severity || 'medium',
+        comm: e.comm || null, cmdline: e.cmdline || null,
+        parent_comm: e.parent_comm || null,
+      })).filter(o => o.key);
+
+      const gqlEndpoint = serverUrl.endsWith('/graphql') ? serverUrl : `${serverUrl.replace(/\/$/, '')}/graphql`;
+      const ingestMutation = `
+        mutation IngestCIBaseline(
+          $project_name: String, $session_id: String,
+          $repo: String!, $job: String!, $branch: String!, $run_id: String!,
+          $run_number: String, $workflow: String, $actor: String, $sha: String,
+          $egress: JSON, $fim_events: JSON
+        ) {
+          IngestCIBaseline(
+            project_name: $project_name session_id: $session_id
+            repo: $repo job: $job branch: $branch run_id: $run_id
+            run_number: $run_number workflow: $workflow actor: $actor sha: $sha
+            egress: $egress fim_events: $fim_events
+          ) {
+            status phase run_count observations deviations new_destinations vuln_id
+          }
+        }
+      `;
+
+      const ref = stepContext.ref || process.env.GITHUB_REF || '';
+      const branchName = stepContext.branch
+        || process.env.GITHUB_REF_NAME
+        || (ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref)
+        || 'main';
+
+      const resp = await axios.post(gqlEndpoint, {
+        query: ingestMutation,
+        variables: {
+          project_name: stepContext.repository || process.env.GITHUB_REPOSITORY || '',
+          session_id: process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_REPOSITORY}_${process.env.GITHUB_RUN_ID}` : null,
+          repo: stepContext.repository || process.env.GITHUB_REPOSITORY || '',
+          job: stepContext.job || process.env.GITHUB_JOB || 'default',
+          branch: branchName,
+          run_id: stepContext.run_id || process.env.GITHUB_RUN_ID || 'unknown',
+          run_number: String(stepContext.run_number || process.env.GITHUB_RUN_NUMBER || ''),
+          workflow: stepContext.workflow || process.env.GITHUB_WORKFLOW || '',
+          actor: stepContext.actor || process.env.GITHUB_ACTOR || '',
+          sha: stepContext.sha || process.env.GITHUB_SHA || '',
+          egress: egressDestinations,
+          fim_events: fimObs,
+        },
+      }, {
+        headers: { authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },
+        timeout: 15000,
+      });
+
+      const result = resp.data?.data?.IngestCIBaseline;
+      if (result) {
+        const newDests = result.new_destinations || [];
+        baselineReport = {
+          phase: result.phase,
+          firstRun: result.run_count <= 1,
+          runCount: result.run_count,
+          deviations: result.deviations,
+          newDestinations: newDests,
+          high_severity_deviations: newDests.map(d => ({ key: d, type: 'egress', severity: 'medium' })),
+          vuln_id: result.vuln_id,
+        };
+        core.info(`[Baseline] Ingested: phase=${result.phase}, run #${result.run_count}, ${result.deviations} deviation(s)`);
+        if (newDests.length > 0) {
+          core.warning(`[Baseline] ⚠️  ${newDests.length} new egress destination(s): ${newDests.join(', ')}`);
+        } else if (!baselineReport.firstRun) {
+          core.info('[Baseline] ✅ All egress matches baseline — no new connections');
+        }
       }
     } catch (e) {
       core.warning(`[Baseline] Analysis failed (non-fatal): ${e.message}`);
