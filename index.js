@@ -83,11 +83,15 @@ async function run() {
       // CI/CD env vars for event tagging
       "-e", `GITHUB_REPOSITORY=${stepContext.repository}`,
       "-e", `GITHUB_RUN_ID=${stepContext.run_id}`,
+      "-e", `GITHUB_RUN_NUMBER=${stepContext.run_number || process.env.GITHUB_RUN_NUMBER || ''}`,
       "-e", `GITHUB_JOB=${stepContext.job}`,
       "-e", `GITHUB_WORKFLOW=${stepContext.workflow}`,
       "-e", `GITHUB_SHA=${stepContext.sha}`,
       "-e", `GITHUB_ACTOR=${stepContext.actor}`,
+      "-e", `GITHUB_REF=${process.env.GITHUB_REF || ''}`,
+      "-e", `GITHUB_REF_NAME=${process.env.GITHUB_REF_NAME || stepContext.branch || ''}`,
       "-e", `RUNNER_NAME=${stepContext.runner_name}`,
+
       dockerImage,
       "all",
       "-m", "text",

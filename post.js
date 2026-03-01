@@ -27,7 +27,7 @@ async function readLog(logType, logPath) {
   return "";
 }
 
-async function readSummaryStats() {
+async function readSummaryStats(apiKey, serverUrl) {
   // 1. Try the binary-written summary first
   try {
     if (await fs.pathExists("/tmp/roc-summary.json")) {
@@ -37,58 +37,93 @@ async function readSummaryStats() {
     core.debug(`Could not read roc-summary.json: ${e.message}`);
   }
 
-  // 2. Synthesize stats from egress JSONL (DPI binary doesn't write summary.json yet)
+  // 2. Synthesize stats from egress JSONL (written by egress-interceptor on host)
+  //    NOTE: The DPI binary runs inside Docker and writes directly to the API,
+  //    not to the host filesystem. So this JSONL will be empty when binary is the
+  //    sole capture source. We fall through to the API query in that case.
   try {
     const EGRESS_LOG = "/tmp/roc-egress-log.jsonl";
-    if (!(await fs.pathExists(EGRESS_LOG))) return null;
-    const content = await fs.readFile(EGRESS_LOG, "utf8");
-    const lines = content.split("\n").filter(l => l.trim());
-    if (lines.length === 0) return null;
-
-    const events = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    const uniqueDests = new Set(events.map(e => { const d = e.domain || e.ip || ''; const p = e.port || 443; return `${d}:${p}`; }));
-    const secretEvents = events.filter(e => e.secrets === true);
-
-    // Try to load step context (written by action.yml pre-step)
-    let stepContext = {};
-    try {
-      if (await fs.pathExists('/tmp/roc-step-context.json')) {
-        stepContext = await fs.readJson('/tmp/roc-step-context.json');
+    if (await fs.pathExists(EGRESS_LOG)) {
+      const content = await fs.readFile(EGRESS_LOG, "utf8");
+      const lines = content.split("\n").filter(l => l.trim());
+      if (lines.length > 0) {
+        const events = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        const uniqueDests = new Set(events.map(e => { const d = e.domain || e.ip || ''; const p = e.port || 443; return `${d}:${p}`; }));
+        const secretEvents = events.filter(e => e.secrets === true || (Array.isArray(e.secrets) && e.secrets.length > 0));
+        let stepContext = {};
+        try {
+          if (await fs.pathExists('/tmp/roc-step-context.json')) {
+            stepContext = await fs.readJson('/tmp/roc-step-context.json');
+          }
+        } catch (e) { /* non-fatal */ }
+        return {
+          tls_connections: events.filter(e => e.source !== 'tcpmonitor').length,
+          unique_destinations: uniqueDests.size,
+          secrets_found: secretEvents.length,
+          secret_details: secretEvents.map(e => ({
+            pattern: 'detected',
+            destination: e.domain || e.ip,
+            step: stepContext.step_name || e.comm || '',
+            comm: e.comm || '',
+          })),
+          blocked_connections: 0,
+          synthesized: true,
+        };
       }
-    } catch (e) { /* non-fatal */ }
-
-    return {
-      tls_connections: events.filter(e => e.source !== 'tcpmonitor').length,
-      unique_destinations: uniqueDests.size,
-      secrets_found: secretEvents.length,
-      secret_details: secretEvents.map(e => ({
-        pattern: 'detected',
-        destination: e.domain || e.ip,
-        step: stepContext.step_name || e.comm || '',
-        comm: e.comm || '',
-        cmdline: e.cmdline || '',
-        parent_comm: e.parent_comm || '',
-      })),
-      blocked_connections: 0,
-      // Rich per-event data for the captures table
-      egress_events: events.map(e => ({
-        domain: e.domain || e.ip || '',
-        ip: e.ip || '',
-        port: e.port || 443,
-        comm: e.comm || '',
-        cmdline: e.cmdline || '',
-        parent_comm: e.parent_comm || '',
-        source: e.source || 'openssl',
-        secrets: !!e.secrets,
-        timestamp: e.timestamp || '',
-      })),
-      synthesized: true,
-    };
+    }
   } catch (e) {
-    core.debug(`Could not synthesize stats: ${e.message}`);
+    core.debug(`Could not synthesize stats from egress log: ${e.message}`);
   }
+
+  // 3. API fallback: query backend for the vuln the binary created for this run.
+  //    The binary runs inside Docker so it writes secrets directly to the API
+  //    (UploadTrafficRuntimeData), not to any host filesystem file.
+  //    We query for the PIPELINE_SECURITY vuln for this project+run to get real counts.
+  if (apiKey && serverUrl) {
+    try {
+      const runId = process.env.GITHUB_RUN_ID || '';
+      const repo = process.env.GITHUB_REPOSITORY || '';
+      const gqlEndpoint = serverUrl.endsWith('/graphql') ? serverUrl : `${serverUrl.replace(/\/$/, '')}/graphql`;
+      const query = `
+        query GetPipelineVuln($project_name: String, $run_id: String) {
+          GetPipelineVulnByRun(project_name: $project_name, run_id: $run_id) {
+            pipeline_context
+          }
+        }
+      `;
+      const resp = await axios.post(gqlEndpoint, {
+        query,
+        variables: { project_name: repo, run_id: runId },
+      }, {
+        headers: { authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },
+        timeout: 8000,
+      });
+      const pCtx = resp.data?.data?.GetPipelineVulnByRun?.pipeline_context;
+      if (pCtx) {
+        const captures = pCtx.captures || [];
+        const secrets = pCtx.secrets || captures.flatMap(c => c.secrets || []);
+        const dests = new Set(captures.map(c => c.request?.host || c.dst_ip).filter(Boolean));
+        core.info(`[SummaryStat] Got vuln stats from API: secrets=${secrets.length} captures=${captures.length}`);
+        return {
+          tls_connections: captures.length,
+          unique_destinations: dests.size,
+          secrets_found: secrets.length,
+          secret_details: secrets.map(s => ({
+            pattern: s.pattern_id || 'detected',
+            destination: s.destination || null,
+          })),
+          blocked_connections: 0,
+          from_api: true,
+        };
+      }
+    } catch (e) {
+      core.debug(`[SummaryStat] API query fallback failed (non-fatal): ${e.message}`);
+    }
+  }
+
   return null;
 }
+
 
 async function getContainerStats(containerId) {
   if (!containerId) return null;
@@ -270,12 +305,10 @@ async function uploadPipelineVuln(apiKey, serverUrl, fimEvents, baselineReport, 
 
   core.info(`[PipelineVuln] Collected: egress_deviations=${egress_deviations.length} fim=${fim.length}`);
   // Note: secrets are now uploaded DIRECTLY by the Go binary via UploadTrafficRuntimeData.
-  // post.js only handles egress baseline deviations and FIM events from the JSONL log.
-  // Skip only if truly nothing to report from our side (binary handles secrets independently).
-  if (egress_deviations.length === 0 && fim.length === 0) {
-    core.info('[PipelineVuln] No egress deviations or FIM events — skipping post.js pipeline vuln upload');
-    return;
-  }
+  // We always call UploadPipelineSecurityFindings regardless of egress/FIM count because:
+  // the binary runs inside Docker and cannot include CI context (repo, run_id, workflow, job,
+  // branch, actor, sha). This mutation merges that CI metadata into the binary-created vuln.
+
 
   const body = {
     repo: stepContext.repository || process.env.GITHUB_REPOSITORY || '',
@@ -605,11 +638,12 @@ async function cleanup() {
   core.info("════════════════════════════════════════");
 
 
-  // 4. Read FIM events + upload to backend
+  // 4. Read FIM events — passed to uploadPipelineVuln as fallback until binary ships FIM upload in Docker image
   const fimEvents = await readFIMEvents();
   if (fimEvents.length > 0) {
     core.warning(`[FIM] ⚠️  ${fimEvents.length} file integrity violation(s) detected during build!`);
-    await uploadFIMEvents(fimEvents, apiKey, serverUrl);
+    // Binary now handles FIM upload via UploadFIMFindings at SIGTERM shutdown.
+    // uploadPipelineVuln below will include fim_events as a fallback.
   }
 
   // 5. Run automated baseline analysis (load → diff → save)
@@ -631,7 +665,8 @@ async function cleanup() {
   }
 
   // 6. Read stats + write GitHub Step Summary
-  const stats = await readSummaryStats();
+  //    readSummaryStats tries: (1) /tmp/roc-summary.json, (2) egress JSONL, (3) API query for binary-created vuln
+  const stats = await readSummaryStats(apiKey, serverUrl);
   await writeStepSummary(stats, egressPolicy, containerId, baselineReport, fimEvents);
 
   // 7. Upload pipeline security vulnerability (secrets + FIM + deviations) to backend
