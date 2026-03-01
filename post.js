@@ -438,51 +438,55 @@ ${(stats.blocked_details || []).map(b =>
   // Automated baseline section
   let baselineSection = '';
   if (baselineReport) {
-    const newDests = baselineReport.newDestinations ?? [];
-    const knownDests = baselineReport.knownDestinations ?? baselineReport.egressClassified?.map(e => e.key) ?? [];
+    const newDestsArr = baselineReport.newDestinations ?? [];
+    const newDestsSet = new Set(newDestsArr);
     const egressEntries = baselineReport.egressEntries ?? [];
+    const knownDests = baselineReport.knownDestinations ?? egressEntries.map(e => e.key);
     const runCount = baselineReport.runCount ?? baselineReport.run_count ?? baselineReport.runs ?? 1;
-    const isFirstRun = baselineReport.firstRun ?? (runCount === 1 && newDests.length === 0);
+    const isFirstRun = baselineReport.firstRun ?? (runCount === 1);
     const obsCount = baselineReport.observations ?? knownDests.length;
+    const phase = baselineReport.phase || 'learning';
 
-    if (isFirstRun) {
-      // Show the full list of observed destinations for day-one baseline
-      const destRows = egressEntries.length > 0
-        ? egressEntries.map(e => {
-          const proc = e.comm ? `\`${e.comm}\`` : '–';
-          const sev = e.severity || 'info';
-          return `| \`${e.key}\` | ${proc} | ${sev} | 🔵 baseline |`;
-        }).join('\n')
-        : `| *(no destinations recorded yet — binary flush pending)* | – | – | – |`;
+    if (newDestsArr.length > 0) alertIcon = alertIcon === '✅' ? '⚠️' : alertIcon;
 
-      baselineSection = `
-### 📊 Egress Baseline (run #${runCount} — Learning Phase)
+    // Process tree: parent_comm → comm
+    const procTree = (e) => {
+      if (e.parent_comm && e.comm && e.parent_comm !== e.comm) return `\`${e.parent_comm}\` → \`${e.comm}\``;
+      if (e.comm) return `\`${e.comm}\``;
+      return '–';
+    };
 
-> **First run** — establishing baseline. ${obsCount} connections observed and recorded.
-> Future runs will flag any **new** outbound connections not seen today.
+    // Build a row for every entry, sorted NEW-first
+    const sorted = [...egressEntries].sort((a, b) => {
+      const aNew = newDestsSet.has(a.key) ? 0 : 1;
+      const bNew = newDestsSet.has(b.key) ? 0 : 1;
+      return aNew - bNew;
+    });
 
-| Destination | Process | Severity | Status |
-|-------------|---------|----------|--------|
-${destRows}
-`;
-    } else {
-      const newRows = newDests.length > 0
-        ? newDests.map(d => `| \`${d}\` | ⚠️ NEW |`).join('\n')
-        : '| *(none)* | ✅ |';
-      if (newDests.length > 0) {
-        alertIcon = alertIcon === '✅' ? '⚠️' : alertIcon;
-      }
-      baselineSection = `
+    const destRows = sorted.length > 0
+      ? sorted.map(e => {
+        const badge = newDestsSet.has(e.key) ? '⚠️ **NEW**' : (e.status === 'trusted' ? '✅ trusted' : '🔵 baseline');
+        const count = e.occurrence_count > 1 ? ` ×${e.occurrence_count}` : '';
+        return `| \`${e.key}\`${count} | ${procTree(e)} | ${badge} |`;
+      }).join('\n')
+      : '| *(no destinations recorded yet — binary flush pending)* | – | – |';
+
+    const phaseNote = phase === 'active' ? 'Active — deviations flagged' : `Learning (${runCount}/5 runs)`;
+    const firstRunNote = isFirstRun
+      ? `**First run** — ${obsCount} connection(s) recorded as baseline. Future runs flag new destinations.`
+      : `**${obsCount}** unique destination(s) across ${runCount} run(s). Phase: ${phaseNote}.`;
+
+    baselineSection = `
 ### 📊 Egress Baseline (run #${runCount})
 
-| Destination | Status |
-|-------------|--------|
-${newRows}
+> ${firstRunNote}${newDestsArr.length > 0 ? `\n> ⚠️ **${newDestsArr.length} new destination(s) flagged as potential supply chain deviation!**` : ''}
 
-**Known destinations:** ${knownDests.length}
+| Destination | Process Chain | Status |
+|-------------|---------------|--------|
+${destRows}
 `;
-    }
   }
+
 
   // FIM violations section
   let fimSection = "";
@@ -526,10 +530,12 @@ ${rows}${more}
 `;
   }
 
-  const tlsCount = stats ? (stats.tls_connections || 0) : "–";
-  const secretsFound = stats ? (stats.secrets_found || 0) : "–";
-  const uniqueDests = stats ? (stats.unique_destinations || 0) : "–";
-  const blockedCount = stats ? (stats.blocked_connections || 0) : "–";
+  const tlsCount = stats ? (stats.tls_connections || 0) : '–';
+  const secretsFound = stats ? (stats.secrets_found || 0) : '–';
+  const uniqueDests = stats ? (stats.unique_destinations || 0) : '–';
+  const blockedCount = stats ? (stats.blocked_connections || 0) : '–';
+  // secrets warning uses alertIcon
+  if (typeof secretsFound === 'number' && secretsFound > 0) alertIcon = '🚨';
 
   const serverUrl = core.getState("serverUrl") || "https://api.codexsecurity.io";
   const dashboardUrl = `${serverUrl}/projects`;
@@ -815,6 +821,33 @@ async function cleanup() {
             } catch (eErr) {
               core.debug(`[Baseline] Could not fetch entries: ${eErr.message}`);
             }
+
+            // Query secret findings for this run from pipeline security vulns
+            try {
+              const runId = stepCtx.run_id || process.env.GITHUB_RUN_ID || '';
+              const secResp = await axios.post(gqlEndpoint, {
+                query: `query { GetPipelineSecurityVulns(limit: 100, page: 1) {
+                  data { vuln_type pipeline_context }
+                }}`,
+                variables: {},
+              }, {
+                headers: { authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },
+                timeout: 8000,
+              });
+              const vulns = secResp.data?.data?.GetPipelineSecurityVulns?.data || [];
+              const secretVulns = vulns.filter(v => {
+                const ctx = v.pipeline_context;
+                return ctx && ctx.run_id === runId &&
+                  Array.isArray(ctx.captures) &&
+                  ctx.captures.some(c => c.type === 'secret' || c.type === 'secret_exfiltration');
+              });
+              if (secretVulns.length > 0) {
+                baselineReport.secretsFound = secretVulns.length;
+                core.warning(`[Secrets] 🚨 ${secretVulns.length} secret finding(s) for run ${runId}`);
+              }
+            } catch (sErr) {
+              core.debug(`[Baseline] Could not query secrets: ${sErr.message}`);
+            }
           }
         } catch (qErr) {
           core.debug(`[Baseline] Could not query latest run: ${qErr.message}`);
@@ -884,11 +917,11 @@ async function cleanup() {
     stats = {
       tls_connections: baselineReport.observations,
       unique_destinations: baselineReport.observations,
-      secrets_found: 0,   // binary uploads secret vulns separately; we count from API
+      secrets_found: baselineReport.secretsFound || 0, // populated by GetPipelineSecurityVulns query
       blocked_connections: 0,
       synthesized_from_baseline: true,
     };
-    core.info(`[SummaryStat] Synthesized from baseline: ${baselineReport.observations} connections observed`);
+    core.info(`[SummaryStat] Synthesized: ${baselineReport.observations} connections, ${stats.secrets_found} secret(s)`);
   }
   await writeStepSummary(stats, egressPolicy, containerId, baselineReport, fimEvents);
 
