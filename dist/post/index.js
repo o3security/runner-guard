@@ -40026,11 +40026,17 @@ async function uploadPipelineVuln(apiKey, serverUrl, fimEvents, baselineReport, 
   }
 
   // Egress deviations from baseline report
-  const egress_deviations = (baselineReport?.deviations || baselineReport?.newDestinations || [])
-    .map(d => typeof d === 'string'
-      ? { destination: d, severity: 'medium', is_new: true }
-      : { destination: d.key || d.destination || d, severity: d.severity || 'medium', is_new: true, process: { comm: d.comm, cmdline: d.cmdline, parent_comm: d.parent_comm } }
-    );
+  // baselineReport.deviations is a NUMBER (count), not an array.
+  // baselineReport.newDestinations OR high_severity_deviations is the actual array.
+  const rawDeviations = Array.isArray(baselineReport?.high_severity_deviations)
+    ? baselineReport.high_severity_deviations
+    : Array.isArray(baselineReport?.newDestinations)
+      ? baselineReport.newDestinations
+      : [];
+  const egress_deviations = rawDeviations.map(d => typeof d === 'string'
+    ? { destination: d, severity: 'medium', is_new: true }
+    : { destination: d.key || d.destination || String(d), severity: d.severity || 'medium', is_new: true, process: { comm: d.comm, cmdline: d.cmdline, parent_comm: d.parent_comm } }
+  );
 
   // FIM events
   const fim = fimEvents.map(e => ({
