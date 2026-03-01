@@ -40126,8 +40126,19 @@ async function cleanup() {
         }
       `;
 
-      const ref = stepContext.ref || process.env.GITHUB_REF || '';
-      const branchName = stepContext.branch
+      // Load step context — written by index.js; fallback to env vars
+      let stepCtx = {};
+      try {
+        if (await fs.pathExists("/tmp/roc-step-context.json")) {
+          stepCtx = await fs.readJson("/tmp/roc-step-context.json");
+        }
+      } catch (_) { }
+
+      core.info(`[Baseline] ${egressDestinations.length} egress connections, ${fimObs.length} FIM events to process`);
+      core.info(`[Baseline] ${new Set(egressDestinations.map(d => d.key)).size} unique egress destinations after dedup`);
+
+      const ref = stepCtx.ref || process.env.GITHUB_REF || "";
+      const branchName = stepCtx.branch
         || process.env.GITHUB_REF_NAME
         || (ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref)
         || 'main';
@@ -40135,16 +40146,16 @@ async function cleanup() {
       const resp = await axios.post(gqlEndpoint, {
         query: ingestMutation,
         variables: {
-          project_name: stepContext.repository || process.env.GITHUB_REPOSITORY || '',
+          project_name: stepCtx.repository || process.env.GITHUB_REPOSITORY || "",
           session_id: process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_REPOSITORY}_${process.env.GITHUB_RUN_ID}` : null,
-          repo: stepContext.repository || process.env.GITHUB_REPOSITORY || '',
-          job: stepContext.job || process.env.GITHUB_JOB || 'default',
+          repo: stepCtx.repository || process.env.GITHUB_REPOSITORY || "",
+          job: stepCtx.job || process.env.GITHUB_JOB || "default",
           branch: branchName,
-          run_id: stepContext.run_id || process.env.GITHUB_RUN_ID || 'unknown',
-          run_number: String(stepContext.run_number || process.env.GITHUB_RUN_NUMBER || ''),
-          workflow: stepContext.workflow || process.env.GITHUB_WORKFLOW || '',
-          actor: stepContext.actor || process.env.GITHUB_ACTOR || '',
-          sha: stepContext.sha || process.env.GITHUB_SHA || '',
+          run_id: stepCtx.run_id || process.env.GITHUB_RUN_ID || "unknown",
+          run_number: String(stepCtx.run_number || process.env.GITHUB_RUN_NUMBER || ""),
+          workflow: stepCtx.workflow || process.env.GITHUB_WORKFLOW || "",
+          actor: stepCtx.actor || process.env.GITHUB_ACTOR || "",
+          sha: stepCtx.sha || process.env.GITHUB_SHA || "",
           egress: egressDestinations,
           fim_events: fimObs,
         },
@@ -40160,12 +40171,13 @@ async function cleanup() {
           phase: result.phase,
           firstRun: result.run_count <= 1,
           runCount: result.run_count,
+          observations: result.observations,
           deviations: result.deviations,
           newDestinations: newDests,
           high_severity_deviations: newDests.map(d => ({ key: d, type: 'egress', severity: 'medium' })),
           vuln_id: result.vuln_id,
         };
-        core.info(`[Baseline] Ingested: phase=${result.phase}, run #${result.run_count}, ${result.deviations} deviation(s)`);
+        core.info(`[Baseline] Ingested: phase=${result.phase}, run #${result.run_count}, ${result.observations} observations, ${result.deviations} deviation(s)`);
         if (newDests.length > 0) {
           core.warning(`[Baseline] ⚠️  ${newDests.length} new egress destination(s): ${newDests.join(', ')}`);
         } else if (!baselineReport.firstRun) {
@@ -40178,8 +40190,21 @@ async function cleanup() {
   }
 
   // 6. Read stats + write GitHub Step Summary
-  //    readSummaryStats tries: (1) /tmp/roc-summary.json, (2) egress JSONL, (3) API query for binary-created vuln
-  const stats = await readSummaryStats(apiKey, serverUrl);
+  //    readSummaryStats tries: /tmp/roc-summary.json → egress JSONL → API query
+  //    If all fail (binary captures inside Docker, no host JSONL), fall back to
+  //    baseline observations from IngestCIBaseline response (which has the real count).
+  let stats = await readSummaryStats(apiKey, serverUrl);
+  if (!stats && baselineReport && baselineReport.observations != null) {
+    // Synthesize from baseline data — binary recorded N unique TLS connections
+    stats = {
+      tls_connections: baselineReport.observations,
+      unique_destinations: baselineReport.observations,
+      secrets_found: 0,   // binary uploads secret vulns separately; we count from API
+      blocked_connections: 0,
+      synthesized_from_baseline: true,
+    };
+    core.info(`[SummaryStat] Synthesized from baseline: ${baselineReport.observations} connections observed`);
+  }
   await writeStepSummary(stats, egressPolicy, containerId, baselineReport, fimEvents);
 
   // 7. Upload pipeline security vulnerability (secrets + FIM + deviations) to backend
