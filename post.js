@@ -436,27 +436,41 @@ ${(stats.blocked_details || []).map(b =>
   }
 
   // Automated baseline section
-  let baselineSection = "";
+  let baselineSection = '';
   if (baselineReport) {
-    // Normalise field names — backend path and cache-only path use different keys
     const newDests = baselineReport.newDestinations ?? [];
     const knownDests = baselineReport.knownDestinations ?? baselineReport.egressClassified?.map(e => e.key) ?? [];
-    const runCount = baselineReport.runs ?? baselineReport.run_count ?? 1;
+    const egressEntries = baselineReport.egressEntries ?? [];
+    const runCount = baselineReport.runCount ?? baselineReport.run_count ?? baselineReport.runs ?? 1;
     const isFirstRun = baselineReport.firstRun ?? (runCount === 1 && newDests.length === 0);
+    const obsCount = baselineReport.observations ?? knownDests.length;
 
     if (isFirstRun) {
-      baselineSection = `
-### 📊 Egress Baseline
+      // Show the full list of observed destinations for day-one baseline
+      const destRows = egressEntries.length > 0
+        ? egressEntries.map(e => {
+          const proc = e.comm ? `\`${e.comm}\`` : '–';
+          const sev = e.severity || 'info';
+          return `| \`${e.key}\` | ${proc} | ${sev} | 🔵 baseline |`;
+        }).join('\n')
+        : `| *(no destinations recorded yet — binary flush pending)* | – | – | – |`;
 
-> **First run** — establishing baseline with ${knownDests.length} destinations observed.  
+      baselineSection = `
+### 📊 Egress Baseline (run #${runCount} — Learning Phase)
+
+> **First run** — establishing baseline. ${obsCount} connections observed and recorded.
 > Future runs will flag any **new** outbound connections not seen today.
+
+| Destination | Process | Severity | Status |
+|-------------|---------|----------|--------|
+${destRows}
 `;
     } else {
       const newRows = newDests.length > 0
-        ? newDests.map(d => `| \`${d}\` | ⚠️ NEW |`).join("\n")
-        : "| *(none)* | ✅ |";
+        ? newDests.map(d => `| \`${d}\` | ⚠️ NEW |`).join('\n')
+        : '| *(none)* | ✅ |';
       if (newDests.length > 0) {
-        alertIcon = alertIcon === "✅" ? "⚠️" : alertIcon;
+        alertIcon = alertIcon === '✅' ? '⚠️' : alertIcon;
       }
       baselineSection = `
 ### 📊 Egress Baseline (run #${runCount})
@@ -642,6 +656,15 @@ async function cleanup() {
   const fimEvents = await readFIMEvents();
   if (fimEvents.length > 0) {
     core.warning(`[FIM] ⚠️  ${fimEvents.length} file integrity violation(s) detected during build!`);
+    core.info('\n🔍 File Integrity Violations:');
+    core.info('─'.repeat(60));
+    fimEvents.slice(0, 20).forEach(e => {
+      const proc = e.comm ? ` [${e.comm}]` : '';
+      const action = e.action || e.event_type || 'modified';
+      core.info(`  🔍 ${action.toUpperCase()} ${e.path || e.filename || '?'}${proc}`);
+    });
+    if (fimEvents.length > 20) core.info(`  … and ${fimEvents.length - 20} more FIM events`);
+    core.info('─'.repeat(60));
     // Binary now handles FIM upload via UploadFIMFindings at SIGTERM shutdown.
     // uploadPipelineVuln below will include fim_events as a fallback.
   }
@@ -755,9 +778,43 @@ async function cleanup() {
               deviations: latestRun.deviations_count || 0,
               newDestinations: [],
               high_severity_deviations: [],
+              knownDestinations: [],
               vuln_id: null,
             };
             core.info(`[Baseline] Latest run fetched: phase=${latestRun.phase}, run #${latestRun.total_run_count}, ${latestRun.observations_count || 0} observations`);
+
+            // Also fetch the actual observed entries so we can display them
+            try {
+              const entriesResp = await axios.post(gqlEndpoint, {
+                query: `query GetBaselineEntries($repo: String, $job: String, $branch: String, $limit: Int) {
+                  GetBaselineEntries(repo: $repo, job: $job, branch: $branch, limit: $limit) {
+                    data { key type severity status comm occurrence_count last_seen }
+                  }
+                }`,
+                variables: { repo: runCtx, job: runJob, branch: branchFallback, limit: 50 },
+              }, {
+                headers: { authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },
+                timeout: 8000,
+              });
+              const entries = entriesResp.data?.data?.GetBaselineEntries?.data || [];
+              const egressEntries = entries.filter(e => e.type !== 'file_modification');
+              baselineReport.knownDestinations = egressEntries.map(e => e.key);
+              baselineReport.egressEntries = egressEntries;
+
+              if (egressEntries.length > 0) {
+                core.info(`\n📡 Egress Destinations (${egressEntries.length} unique):`);
+                core.info('─'.repeat(60));
+                egressEntries.forEach(e => {
+                  const proc = e.comm ? ` [${e.comm}]` : '';
+                  const count = e.occurrence_count > 1 ? ` ×${e.occurrence_count}` : '';
+                  const badge = e.status === 'trusted' ? '✅' : e.status === 'new' ? '⚠️ NEW' : '🔵';
+                  core.info(`  ${badge} ${e.key}${proc}${count}`);
+                });
+                core.info('─'.repeat(60));
+              }
+            } catch (eErr) {
+              core.debug(`[Baseline] Could not fetch entries: ${eErr.message}`);
+            }
           }
         } catch (qErr) {
           core.debug(`[Baseline] Could not query latest run: ${qErr.message}`);
