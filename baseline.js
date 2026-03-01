@@ -265,15 +265,40 @@ async function runIngest(apiKey, serverUrl) {
 
     core.info(`[Baseline] ${egressRaw.length} egress connections, ${fimRaw.length} FIM events to process`);
 
-    // Classify egress — run DNS checks in parallel (capped at 20 to avoid slowdown)
-    const egressToCheck = egressRaw.slice(0, 100);
+    // Deduplicate by domain:port:comm — same endpoint from different processes
+    // (e.g. npm + curl both hitting registry.npmjs.org) logs as separate supply-chain events.
+    const seen = new Set();
+    const egressDeduped = egressRaw.filter(e => {
+        const domain = (e.domain || e.host || e.ip || 'unknown').toLowerCase();
+        const port = e.port || 443;
+        const comm = e.comm || '';
+        const key = `${domain}:${port}:${comm}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+    core.info(`[Baseline] ${egressDeduped.length} unique egress destinations after dedup`);
+
+    // Classify egress — run DNS checks in parallel (capped at 100)
+    const egressToCheck = egressDeduped.slice(0, 100);
     const egressClassified = await Promise.all(
         egressToCheck.map(async (e) => {
             const domain = (e.domain || e.host || e.ip || 'unknown').toLowerCase();
             const port = e.port || 443;
-            const key = `${domain}:${port}`;
+            const comm = e.comm || '';
+            // Key includes comm so UI can show "npm → registry.npmjs.org" separately from "curl → registry.npmjs.org"
+            const key = comm ? `${domain}:${port}:${comm}` : `${domain}:${port}`;
             const { severity, severity_reason, ...extra } = await classifyEgress(e);
-            return { key, severity, severity_reason, tls_cert_not_before: e.tls_cert_not_before || null, ...extra };
+            return {
+                key, severity, severity_reason,
+                tls_cert_not_before: e.tls_cert_not_before || null,
+                // Supply chain source fields — displayed in UI Captures tab + Step Summary
+                comm,
+                cmdline: e.cmdline || '',
+                parent_comm: e.parent_comm || '',
+                source: e.source || 'openssl',
+                ...extra,
+            };
         })
     );
 

@@ -28,12 +28,64 @@ async function readLog(logType, logPath) {
 }
 
 async function readSummaryStats() {
+  // 1. Try the binary-written summary first
   try {
     if (await fs.pathExists("/tmp/roc-summary.json")) {
       return await fs.readJson("/tmp/roc-summary.json");
     }
   } catch (e) {
     core.debug(`Could not read roc-summary.json: ${e.message}`);
+  }
+
+  // 2. Synthesize stats from egress JSONL (DPI binary doesn't write summary.json yet)
+  try {
+    const EGRESS_LOG = "/tmp/roc-egress-log.jsonl";
+    if (!(await fs.pathExists(EGRESS_LOG))) return null;
+    const content = await fs.readFile(EGRESS_LOG, "utf8");
+    const lines = content.split("\n").filter(l => l.trim());
+    if (lines.length === 0) return null;
+
+    const events = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const uniqueDests = new Set(events.map(e => { const d = e.domain || e.ip || ''; const p = e.port || 443; return `${d}:${p}`; }));
+    const secretEvents = events.filter(e => e.secrets === true);
+
+    // Try to load step context (written by action.yml pre-step)
+    let stepContext = {};
+    try {
+      if (await fs.pathExists('/tmp/roc-step-context.json')) {
+        stepContext = await fs.readJson('/tmp/roc-step-context.json');
+      }
+    } catch (e) { /* non-fatal */ }
+
+    return {
+      tls_connections: events.filter(e => e.source !== 'tcpmonitor').length,
+      unique_destinations: uniqueDests.size,
+      secrets_found: secretEvents.length,
+      secret_details: secretEvents.map(e => ({
+        pattern: 'detected',
+        destination: e.domain || e.ip,
+        step: stepContext.step_name || e.comm || '',
+        comm: e.comm || '',
+        cmdline: e.cmdline || '',
+        parent_comm: e.parent_comm || '',
+      })),
+      blocked_connections: 0,
+      // Rich per-event data for the captures table
+      egress_events: events.map(e => ({
+        domain: e.domain || e.ip || '',
+        ip: e.ip || '',
+        port: e.port || 443,
+        comm: e.comm || '',
+        cmdline: e.cmdline || '',
+        parent_comm: e.parent_comm || '',
+        source: e.source || 'openssl',
+        secrets: !!e.secrets,
+        timestamp: e.timestamp || '',
+      })),
+      synthesized: true,
+    };
+  } catch (e) {
+    core.debug(`Could not synthesize stats: ${e.message}`);
   }
   return null;
 }
@@ -114,11 +166,15 @@ async function writeStepSummary(stats, egressPolicy, containerId, baselineReport
     secretSection = `
 ### 🚨 Secrets Detected in Network Traffic
 
-| Pattern | Destination | Step |
-|---------|-------------|------|
-${(stats.secret_details || []).map(s =>
-      `| \`${s.pattern || "regex"}\` | \`${s.destination || "unknown"}\` | ${s.step || "-"} |`
-    ).join("\n")}
+| Pattern | Destination | Step | Process | Parent | Command |
+|---------|-------------|------|---------|--------|---------|
+${(stats.secret_details || []).map(s => {
+      const step = s.step || '-';
+      const proc = s.comm ? `\`${s.comm}\`` : '-';
+      const parent = s.parent_comm ? `\`${s.parent_comm}\`` : '-';
+      const cmd = s.cmdline ? `\`${s.cmdline.slice(0, 60)}\`` : '-';
+      return `| \`${s.pattern || 'regex'}\` | \`${s.destination || 'unknown'}\` | ${step} | ${proc} | ${parent} | ${cmd} |`;
+    }).join("\n")}
 
 > **Action Required:** Rotate the above credentials immediately.
 `;
@@ -189,6 +245,31 @@ ${rows}${more}
 `;
   }
 
+  // Captured connections section — shows supply chain process context
+  let capturesSection = "";
+  const captureEvents = stats?.egress_events || [];
+  if (captureEvents.length > 0) {
+    const rows = captureEvents.slice(0, 30).map(e => {
+      const dest = `${e.domain || e.ip}:${e.port}`;
+      const proc = e.comm ? `\`${e.comm}\`` : "–";
+      const cmd = e.cmdline ? `\`${e.cmdline.slice(0, 60)}\`` : "–";
+      const par = e.parent_comm ? `\`${e.parent_comm}\`` : "–";
+      const src = e.source === "tcpmonitor" ? "TCP" : "TLS/SSL";
+      const sec = e.secrets ? "🚨" : "";
+      return `| \`${dest}\` | ${proc} | ${cmd} | ${par} | ${src} ${sec}|`;
+    }).join("\n");
+    const more = captureEvents.length > 30 ? `\n> _…and ${captureEvents.length - 30} more connections_` : "";
+    capturesSection = `
+### 🔗 Captured Connections (${captureEvents.length})
+
+| Destination | Process | Command | Parent | Source |
+|-------------|---------|---------|--------|--------|
+${rows}${more}
+
+> _Supply chain context: **Process** shows which binary made the request, **Parent** shows what spawned it (e.g. \`npm\`→\`bash\`→\`curl\`→evil.io)_
+`;
+  }
+
   const tlsCount = stats ? (stats.tls_connections || 0) : "–";
   const secretsFound = stats ? (stats.secrets_found || 0) : "–";
   const uniqueDests = stats ? (stats.unique_destinations || 0) : "–";
@@ -214,6 +295,7 @@ ${rows}${more}
 ${secretSection}
 ${egressSection}
 ${fimSection}
+${capturesSection}
 ${baselineSection}
 ---
 🛡️ Powered by [O3 Security ROC Agent](https://github.com/o3security/roc-agent)  

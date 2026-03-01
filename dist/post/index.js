@@ -271,15 +271,40 @@ async function runIngest(apiKey, serverUrl) {
 
     core.info(`[Baseline] ${egressRaw.length} egress connections, ${fimRaw.length} FIM events to process`);
 
-    // Classify egress — run DNS checks in parallel (capped at 20 to avoid slowdown)
-    const egressToCheck = egressRaw.slice(0, 100);
+    // Deduplicate by domain:port:comm — same endpoint from different processes
+    // (e.g. npm + curl both hitting registry.npmjs.org) logs as separate supply-chain events.
+    const seen = new Set();
+    const egressDeduped = egressRaw.filter(e => {
+        const domain = (e.domain || e.host || e.ip || 'unknown').toLowerCase();
+        const port = e.port || 443;
+        const comm = e.comm || '';
+        const key = `${domain}:${port}:${comm}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+    core.info(`[Baseline] ${egressDeduped.length} unique egress destinations after dedup`);
+
+    // Classify egress — run DNS checks in parallel (capped at 100)
+    const egressToCheck = egressDeduped.slice(0, 100);
     const egressClassified = await Promise.all(
         egressToCheck.map(async (e) => {
             const domain = (e.domain || e.host || e.ip || 'unknown').toLowerCase();
             const port = e.port || 443;
-            const key = `${domain}:${port}`;
+            const comm = e.comm || '';
+            // Key includes comm so UI can show "npm → registry.npmjs.org" separately from "curl → registry.npmjs.org"
+            const key = comm ? `${domain}:${port}:${comm}` : `${domain}:${port}`;
             const { severity, severity_reason, ...extra } = await classifyEgress(e);
-            return { key, severity, severity_reason, tls_cert_not_before: e.tls_cert_not_before || null, ...extra };
+            return {
+                key, severity, severity_reason,
+                tls_cert_not_before: e.tls_cert_not_before || null,
+                // Supply chain source fields — displayed in UI Captures tab + Step Summary
+                comm,
+                cmdline: e.cmdline || '',
+                parent_comm: e.parent_comm || '',
+                source: e.source || 'openssl',
+                ...extra,
+            };
         })
     );
 
@@ -39808,12 +39833,49 @@ async function readLog(logType, logPath) {
 }
 
 async function readSummaryStats() {
+  // 1. Try the binary-written summary first
   try {
     if (await fs.pathExists("/tmp/roc-summary.json")) {
       return await fs.readJson("/tmp/roc-summary.json");
     }
   } catch (e) {
     core.debug(`Could not read roc-summary.json: ${e.message}`);
+  }
+
+  // 2. Synthesize stats from egress JSONL (DPI binary doesn't write summary.json yet)
+  try {
+    const EGRESS_LOG = "/tmp/roc-egress-log.jsonl";
+    if (!(await fs.pathExists(EGRESS_LOG))) return null;
+    const content = await fs.readFile(EGRESS_LOG, "utf8");
+    const lines = content.split("\n").filter(l => l.trim());
+    if (lines.length === 0) return null;
+
+    const events = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const uniqueDests = new Set(events.map(e => { const d = e.domain || e.ip || ''; const p = e.port || 443; return `${d}:${p}`; }));
+    const secretEvents = events.filter(e => e.secrets === true);
+
+    return {
+      tls_connections: events.filter(e => e.source !== 'tcpmonitor').length,
+      unique_destinations: uniqueDests.size,
+      secrets_found: secretEvents.length,
+      secret_details: secretEvents.map(e => ({ pattern: 'detected', destination: e.domain || e.ip, step: e.comm || '' })),
+      blocked_connections: 0,
+      // Rich per-event data for the captures table
+      egress_events: events.map(e => ({
+        domain: e.domain || e.ip || '',
+        ip: e.ip || '',
+        port: e.port || 443,
+        comm: e.comm || '',
+        cmdline: e.cmdline || '',
+        parent_comm: e.parent_comm || '',
+        source: e.source || 'openssl',
+        secrets: !!e.secrets,
+        timestamp: e.timestamp || '',
+      })),
+      synthesized: true,
+    };
+  } catch (e) {
+    core.debug(`Could not synthesize stats: ${e.message}`);
   }
   return null;
 }
@@ -39969,6 +40031,31 @@ ${rows}${more}
 `;
   }
 
+  // Captured connections section — shows supply chain process context
+  let capturesSection = "";
+  const captureEvents = stats?.egress_events || [];
+  if (captureEvents.length > 0) {
+    const rows = captureEvents.slice(0, 30).map(e => {
+      const dest = `${e.domain || e.ip}:${e.port}`;
+      const proc = e.comm ? `\`${e.comm}\`` : "–";
+      const cmd = e.cmdline ? `\`${e.cmdline.slice(0, 60)}\`` : "–";
+      const par = e.parent_comm ? `\`${e.parent_comm}\`` : "–";
+      const src = e.source === "tcpmonitor" ? "TCP" : "TLS/SSL";
+      const sec = e.secrets ? "🚨" : "";
+      return `| \`${dest}\` | ${proc} | ${cmd} | ${par} | ${src} ${sec}|`;
+    }).join("\n");
+    const more = captureEvents.length > 30 ? `\n> _…and ${captureEvents.length - 30} more connections_` : "";
+    capturesSection = `
+### 🔗 Captured Connections (${captureEvents.length})
+
+| Destination | Process | Command | Parent | Source |
+|-------------|---------|---------|--------|--------|
+${rows}${more}
+
+> _Supply chain context: **Process** shows which binary made the request, **Parent** shows what spawned it (e.g. \`npm\`→\`bash\`→\`curl\`→evil.io)_
+`;
+  }
+
   const tlsCount = stats ? (stats.tls_connections || 0) : "–";
   const secretsFound = stats ? (stats.secrets_found || 0) : "–";
   const uniqueDests = stats ? (stats.unique_destinations || 0) : "–";
@@ -39994,6 +40081,7 @@ ${rows}${more}
 ${secretSection}
 ${egressSection}
 ${fimSection}
+${capturesSection}
 ${baselineSection}
 ---
 🛡️ Powered by [O3 Security ROC Agent](https://github.com/o3security/roc-agent)  
