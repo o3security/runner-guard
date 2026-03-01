@@ -294,14 +294,21 @@ async function uploadPipelineVuln(apiKey, serverUrl, fimEvents, baselineReport, 
   ];
 
 
-  // FIM events
+  // FIM events — egress-interceptor writes {path, action, step_name, job, source}
+  // action = 'MODIFIED' | 'CREATED'; event_type from binary = 'write'|'read'|etc.
   const fim = fimEvents.map(e => ({
+    key: e.path || e.filename || null,       // required by IngestCIBaseline allObs loop
     path: e.path || e.filename || null,
-    event_type: e.event_type || e.type || 'write',
+    event_type: e.event_type || e.type || e.action?.toLowerCase() || 'write',
     severity: e.severity || 'medium',
     timestamp: e.timestamp || null,
-    process: { comm: e.comm, cmdline: e.cmdline, parent_comm: e.parent_comm },
-  }));
+    comm: e.comm || null,
+    cmdline: e.cmdline || null,
+    parent_comm: e.parent_comm || null,
+    source: e.source || 'node-interceptor',
+    step_name: e.step_name || null,
+  })).filter(e => e.key);  // skip events with no path
+
 
   core.info(`[PipelineVuln] Collected: egress_deviations=${egress_deviations.length} fim=${fim.length} stats.secrets=${stats?.secrets_found ?? 0}`);
 
