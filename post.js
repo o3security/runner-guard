@@ -725,13 +725,13 @@ async function cleanup() {
           $project_name: String, $session_id: String,
           $repo: String!, $job: String!, $branch: String!, $run_id: String!,
           $run_number: String, $workflow: String, $actor: String, $sha: String,
-          $egress: JSON, $fim_events: JSON
+          $egress: JSON, $fim_events: JSON, $allowed_domains: [String]
         ) {
           IngestCIBaseline(
             project_name: $project_name session_id: $session_id
             repo: $repo job: $job branch: $branch run_id: $run_id
             run_number: $run_number workflow: $workflow actor: $actor sha: $sha
-            egress: $egress fim_events: $fim_events
+            egress: $egress fim_events: $fim_events allowed_domains: $allowed_domains
           ) {
             status phase run_count observations deviations new_destinations vuln_id
           }
@@ -886,6 +886,10 @@ async function cleanup() {
             sha: stepCtx.sha || process.env.GITHUB_SHA || '',
             egress: egressDestinations,
             fim_events: fimObs,
+            allowed_domains: (core.getInput('allowed_domains') || '')
+              .split('\n')
+              .map(l => l.trim())
+              .filter(l => l && !l.startsWith('#')),
           },
         }, {
           headers: { authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },
