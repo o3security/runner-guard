@@ -40016,64 +40016,8 @@ async function uploadPipelineVuln(apiKey, serverUrl, fimEvents, baselineReport, 
     return null;
   }
 
-  // Build secrets array from egress log entries that had secrets=true
-  const secrets = [];
-  try {
-    const EGRESS_LOG = "/tmp/roc-egress-log.jsonl";
-    if (await fs.pathExists(EGRESS_LOG)) {
-      const content = await fs.readFile(EGRESS_LOG, "utf8");
-      for (const line of content.split("\n")) {
-        const t = line.trim();
-        if (!t) continue;
-        try {
-          const ev = JSON.parse(t);
-          if (ev.secrets && ev.secrets !== true) {
-            // ev.secrets is an array of {pattern_id, matched_text, evidence, evidence_type}
-            for (const s of (Array.isArray(ev.secrets) ? ev.secrets : [])) {
-              // Re-scan evidence snippet if matched_text is missing
-              let matchedText = s.matched_text || null;
-              if (!matchedText && s.evidence) {
-                const scan = scanForSecrets(s.evidence);
-                if (scan) matchedText = scan.matched_text;
-              }
-              secrets.push({
-                pattern_id: s.pattern_id || 'unknown',
-                severity: s.severity || 'high',
-                matched_text: matchedText,
-                destination: ev.domain || ev.ip || null,
-                step_name: parseStepName(s.evidence) || ev.comm || null,
-                evidence_snippet: (s.evidence || '').slice(0, 300),
-                process: {
-                  comm: ev.comm || null,
-                  cmdline: ev.cmdline || null,
-                  parent_comm: ev.parent_comm || null,
-                  parent_cmdline: ev.parent_cmdline || null,
-                },
-              });
-            }
-          } else if (ev.secrets === true) {
-            // Older format — binary only sets flag, no detail
-            // Re-scan any available text fields with our own patterns
-            const scanTargets = [ev.cmdline, ev.parent_cmdline, ev.comm, ev.domain].filter(Boolean).join(' ');
-            const scan = scanForSecrets(scanTargets);
-            secrets.push({
-              pattern_id: scan ? scan.pattern_id : 'detected',
-              severity: scan ? scan.severity : 'high',
-              matched_text: scan ? scan.matched_text : null,
-              destination: ev.domain || ev.ip || null,
-              step_name: ev.comm || null,
-              process: { comm: ev.comm, cmdline: ev.cmdline, parent_comm: ev.parent_comm, parent_cmdline: ev.parent_cmdline },
-            });
-          }
-        } catch (_) { /* skip malformed lines */ }
-      }
-
-    }
-  } catch (e) {
-    core.debug(`[PipelineVuln] Could not read egress log: ${e.message}`);
-  }
-
   // ── Build egress deviations ───────────────────────────────────────────────
+
   // Source 1: egress JSONL log (from egress-interceptor or roc binary) — has full request data
   const egressLogEntries = [];
   try {
@@ -40195,11 +40139,12 @@ async function uploadPipelineVuln(apiKey, serverUrl, fimEvents, baselineReport, 
     process: { comm: e.comm, cmdline: e.cmdline, parent_comm: e.parent_comm },
   }));
 
-  core.info(`[PipelineVuln] Collected: secrets=${secrets.length} egress_deviations=${egress_deviations.length} fim=${fim.length}`);
-
-  // Skip if nothing to report
-  if (secrets.length === 0 && egress_deviations.length === 0 && fim.length === 0) {
-    core.info('[PipelineVuln] Nothing to report — skipping vulnerability creation');
+  core.info(`[PipelineVuln] Collected: egress_deviations=${egress_deviations.length} fim=${fim.length}`);
+  // Note: secrets are now uploaded DIRECTLY by the Go binary via UploadTrafficRuntimeData.
+  // post.js only handles egress baseline deviations and FIM events from the JSONL log.
+  // Skip only if truly nothing to report from our side (binary handles secrets independently).
+  if (egress_deviations.length === 0 && fim.length === 0) {
+    core.info('[PipelineVuln] No egress deviations or FIM events — skipping post.js pipeline vuln upload');
     return;
   }
 
@@ -40215,9 +40160,10 @@ async function uploadPipelineVuln(apiKey, serverUrl, fimEvents, baselineReport, 
     branch: stepContext.branch || process.env.GITHUB_REF_NAME || '',
     session_id: stats?.session_id || null,
     project_name: stepContext.repository || process.env.GITHUB_REPOSITORY || '',
-    secrets,
+    secrets: [],    // populated by Go binary via UploadTrafficRuntimeData — not from post.js
     fim_events: fim,
     egress_deviations,
+
   };
 
   try {
