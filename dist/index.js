@@ -30494,6 +30494,29 @@ async function run() {
     if (printOnly) dockerArgs.push("--print-only");
     if (debug) dockerArgs.push("--debug");
 
+    // ── Pull image with retry (ECR Public rate-limits unauthenticated pulls) ─
+    core.info(`Pulling ROC image: ${dockerImage}`);
+    let pulled = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const pullResult = await new Promise(resolve => {
+        const p = (__nccwpck_require__(5317).spawnSync)(
+          'sudo', ['docker', 'pull', dockerImage],
+          { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }
+        );
+        resolve({ ok: p.status === 0, stderr: (p.stderr || '').toString() });
+      });
+      if (pullResult.ok) { pulled = true; break; }
+      const isRateLimit = pullResult.stderr.includes('toomanyrequests') || pullResult.stderr.includes('Rate exceeded');
+      if (isRateLimit && attempt < 3) {
+        const wait = attempt * 15;
+        core.warning(`[Docker] ECR rate limit hit — retrying pull in ${wait}s (attempt ${attempt}/3)…`);
+        await new Promise(r => setTimeout(r, wait * 1000));
+      } else {
+        core.warning(`[Docker] Pull failed (attempt ${attempt}/3): ${pullResult.stderr.trim().slice(0, 200)}`);
+        if (attempt === 3) core.setFailed(`Failed to pull ROC image after 3 attempts: ${pullResult.stderr.trim().slice(0, 200)}`);
+      }
+    }
+
     // ── Spawn container ───────────────────────────────────────────────────
     const outStream = fs.openSync("/tmp/roc-stdout.log", "a");
     const errStream = fs.openSync("/tmp/roc-stderr.log", "a");
@@ -30519,7 +30542,7 @@ async function run() {
       // Use the ncc-bundled version (includes chokidar + all deps)
       // Falls back to raw source if bundle not present
       const bundlePath = (__nccwpck_require__(6928).join)(__dirname, 'interceptor', 'index.js');
-      const rawPath = __nccwpck_require__.ab + "egress-interceptor.js";
+      const rawPath = (__nccwpck_require__(6928).join)(__dirname, 'egress-interceptor.js');
       const fs = __nccwpck_require__(9896);
       const interceptorPath = fs.existsSync(bundlePath) ? bundlePath : rawPath;
       const iOut = fs.openSync('/tmp/roc-interceptor.log', 'a');
