@@ -30433,7 +30433,25 @@ async function run() {
     // Add API credentials if provided
     if (apiKey) dockerArgs.push("--api-key", apiKey);
     if (serverUrl) dockerArgs.push("--server-url", serverUrl);
-    if (projectName) dockerArgs.push("--project", projectName);
+
+    // project_name defaults to GITHUB_REPOSITORY so UploadTrafficRuntimeData
+    // always knows which project to associate captures with.
+    const effectiveProject = projectName || stepContext.repository;
+    if (effectiveProject) dockerArgs.push("--project", effectiveProject);
+
+    // --identifier lets the DPI binary fetch API patterns from the backend.
+    const repoUrl = stepContext.repository
+      ? `https://github.com/${stepContext.repository}`
+      : "";
+    if (repoUrl) dockerArgs.push("--identifier", repoUrl);
+
+    // DEBUG: Print key DPI launch params so we can trace upload failures
+    core.info(`[DEBUG] DPI launch params:`);
+    core.info(`  api_key_set=${!!apiKey}  api_key_prefix=${apiKey ? apiKey.slice(0, 8) + '...' : '(none)'}`);
+    core.info(`  server_url=${serverUrl}`);
+    core.info(`  effective_project=${effectiveProject || '(none)'}`);
+    core.info(`  identifier=${repoUrl || '(none)'}`);
+    core.info(`  patterns_input=${patterns || '(none)'}`);
 
     // Inline policy file
     dockerArgs.push(...policyFileArg);
