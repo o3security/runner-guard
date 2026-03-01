@@ -722,51 +722,94 @@ async function cleanup() {
       core.info(`[Baseline] ${egressDestinations.length} egress connections, ${fimObs.length} FIM events to process`);
       core.info(`[Baseline] ${new Set(egressDestinations.map(d => d.key)).size} unique egress destinations after dedup`);
 
-      const ref = stepCtx.ref || process.env.GITHUB_REF || "";
-      const branchName = stepCtx.branch
-        || process.env.GITHUB_REF_NAME
-        || (ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref)
-        || 'main';
+      // If post.js has NO egress data (binary captures inside Docker → JSONL empty) AND no FIM events,
+      // the binary already called IngestCIBaseline at shutdown with the real observations.
+      // Skip the call to avoid creating a duplicate run with 0 observations.
+      // Instead, query the latest baseline run to get the real stats for step summary.
+      if (egressDestinations.length === 0 && fimObs.length === 0) {
+        core.info('[Baseline] No host-side egress data — binary already ingested via FlushEgressBaseline. Querying latest run for stats.');
+        try {
+          const runCtx = stepCtx.repository || process.env.GITHUB_REPOSITORY || '';
+          const runJob = stepCtx.job || process.env.GITHUB_JOB || 'default';
+          const refStr = stepCtx.ref || process.env.GITHUB_REF || '';
+          const branchFallback = stepCtx.branch || process.env.GITHUB_REF_NAME
+            || (refStr.startsWith('refs/heads/') ? refStr.slice('refs/heads/'.length) : refStr) || 'main';
+          const latestRunResp = await axios.post(gqlEndpoint, {
+            query: `query GetBaselineRuns($repo: String, $job: String, $branch: String, $limit: Int) {
+              GetBaselineRuns(repo: $repo, job: $job, branch: $branch, limit: $limit) {
+                data { phase run_id total_run_count observations_count deviations_count ran_at }
+              }
+            }`,
+            variables: { repo: runCtx, job: runJob, branch: branchFallback, limit: 1 },
+          }, {
+            headers: { authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },
+            timeout: 8000,
+          });
+          const latestRun = latestRunResp.data?.data?.GetBaselineRuns?.data?.[0];
+          if (latestRun) {
+            baselineReport = {
+              phase: latestRun.phase,
+              firstRun: latestRun.total_run_count <= 1,
+              runCount: latestRun.total_run_count,
+              observations: latestRun.observations_count || 0,
+              deviations: latestRun.deviations_count || 0,
+              newDestinations: [],
+              high_severity_deviations: [],
+              vuln_id: null,
+            };
+            core.info(`[Baseline] Latest run fetched: phase=${latestRun.phase}, run #${latestRun.total_run_count}, ${latestRun.observations_count || 0} observations`);
+          }
+        } catch (qErr) {
+          core.debug(`[Baseline] Could not query latest run: ${qErr.message}`);
+        }
+      } else {
+        // Host-side egress or FIM data available — call IngestCIBaseline directly
+        const ref = stepCtx.ref || process.env.GITHUB_REF || '';
+        const branchName = stepCtx.branch
+          || process.env.GITHUB_REF_NAME
+          || (ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref)
+          || 'main';
 
-      const resp = await axios.post(gqlEndpoint, {
-        query: ingestMutation,
-        variables: {
-          project_name: stepCtx.repository || process.env.GITHUB_REPOSITORY || "",
-          session_id: process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_REPOSITORY}_${process.env.GITHUB_RUN_ID}` : null,
-          repo: stepCtx.repository || process.env.GITHUB_REPOSITORY || "",
-          job: stepCtx.job || process.env.GITHUB_JOB || "default",
-          branch: branchName,
-          run_id: stepCtx.run_id || process.env.GITHUB_RUN_ID || "unknown",
-          run_number: String(stepCtx.run_number || process.env.GITHUB_RUN_NUMBER || ""),
-          workflow: stepCtx.workflow || process.env.GITHUB_WORKFLOW || "",
-          actor: stepCtx.actor || process.env.GITHUB_ACTOR || "",
-          sha: stepCtx.sha || process.env.GITHUB_SHA || "",
-          egress: egressDestinations,
-          fim_events: fimObs,
-        },
-      }, {
-        headers: { authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },
-        timeout: 15000,
-      });
+        const resp = await axios.post(gqlEndpoint, {
+          query: ingestMutation,
+          variables: {
+            project_name: stepCtx.repository || process.env.GITHUB_REPOSITORY || '',
+            session_id: process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_REPOSITORY}_${process.env.GITHUB_RUN_ID}` : null,
+            repo: stepCtx.repository || process.env.GITHUB_REPOSITORY || '',
+            job: stepCtx.job || process.env.GITHUB_JOB || 'default',
+            branch: branchName,
+            run_id: stepCtx.run_id || process.env.GITHUB_RUN_ID || 'unknown',
+            run_number: String(stepCtx.run_number || process.env.GITHUB_RUN_NUMBER || ''),
+            workflow: stepCtx.workflow || process.env.GITHUB_WORKFLOW || '',
+            actor: stepCtx.actor || process.env.GITHUB_ACTOR || '',
+            sha: stepCtx.sha || process.env.GITHUB_SHA || '',
+            egress: egressDestinations,
+            fim_events: fimObs,
+          },
+        }, {
+          headers: { authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },
+          timeout: 15000,
+        });
 
-      const result = resp.data?.data?.IngestCIBaseline;
-      if (result) {
-        const newDests = result.new_destinations || [];
-        baselineReport = {
-          phase: result.phase,
-          firstRun: result.run_count <= 1,
-          runCount: result.run_count,
-          observations: result.observations,
-          deviations: result.deviations,
-          newDestinations: newDests,
-          high_severity_deviations: newDests.map(d => ({ key: d, type: 'egress', severity: 'medium' })),
-          vuln_id: result.vuln_id,
-        };
-        core.info(`[Baseline] Ingested: phase=${result.phase}, run #${result.run_count}, ${result.observations} observations, ${result.deviations} deviation(s)`);
-        if (newDests.length > 0) {
-          core.warning(`[Baseline] ⚠️  ${newDests.length} new egress destination(s): ${newDests.join(', ')}`);
-        } else if (!baselineReport.firstRun) {
-          core.info('[Baseline] ✅ All egress matches baseline — no new connections');
+        const result = resp.data?.data?.IngestCIBaseline;
+        if (result) {
+          const newDests = result.new_destinations || [];
+          baselineReport = {
+            phase: result.phase,
+            firstRun: result.run_count <= 1,
+            runCount: result.run_count,
+            observations: result.observations,
+            deviations: result.deviations,
+            newDestinations: newDests,
+            high_severity_deviations: newDests.map(d => ({ key: d, type: 'egress', severity: 'medium' })),
+            vuln_id: result.vuln_id,
+          };
+          core.info(`[Baseline] Ingested: phase=${result.phase}, run #${result.run_count}, ${result.observations} observations, ${result.deviations} deviation(s)`);
+          if (newDests.length > 0) {
+            core.warning(`[Baseline] ⚠️  ${newDests.length} new egress destination(s): ${newDests.join(', ')}`);
+          } else if (!baselineReport.firstRun) {
+            core.info('[Baseline] ✅ All egress matches baseline — no new connections');
+          }
         }
       }
     } catch (e) {
