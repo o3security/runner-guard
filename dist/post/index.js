@@ -39709,14 +39709,21 @@ async function uploadPipelineVuln(apiKey, serverUrl, fimEvents, baselineReport, 
   ];
 
 
-  // FIM events
+  // FIM events — egress-interceptor writes {path, action, step_name, job, source}
+  // action = 'MODIFIED' | 'CREATED'; event_type from binary = 'write'|'read'|etc.
   const fim = fimEvents.map(e => ({
+    key: e.path || e.filename || null,       // required by IngestCIBaseline allObs loop
     path: e.path || e.filename || null,
-    event_type: e.event_type || e.type || 'write',
+    event_type: e.event_type || e.type || e.action?.toLowerCase() || 'write',
     severity: e.severity || 'medium',
     timestamp: e.timestamp || null,
-    process: { comm: e.comm, cmdline: e.cmdline, parent_comm: e.parent_comm },
-  }));
+    comm: e.comm || null,
+    cmdline: e.cmdline || null,
+    parent_comm: e.parent_comm || null,
+    source: e.source || 'node-interceptor',
+    step_name: e.step_name || null,
+  })).filter(e => e.key);  // skip events with no path
+
 
   core.info(`[PipelineVuln] Collected: egress_deviations=${egress_deviations.length} fim=${fim.length} stats.secrets=${stats?.secrets_found ?? 0}`);
 
@@ -39864,7 +39871,9 @@ ${(stats.blocked_details || []).map(b =>
     const obsCount = baselineReport.observations ?? knownDests.length;
     const phase = baselineReport.phase || 'learning';
 
-    if (newDestsArr.length > 0) alertIcon = alertIcon === '✅' ? '⚠️' : alertIcon;
+    const untrustedEntries = egressEntries.filter(e => e.status === 'untrusted');
+    if (untrustedEntries.length > 0) alertIcon = '🚨';
+    if (newDestsArr.length > 0 && alertIcon === '✅') alertIcon = '⚠️';
 
     // Process tree: parent_comm → comm
     const procTree = (e) => {
@@ -39873,16 +39882,21 @@ ${(stats.blocked_details || []).map(b =>
       return '–';
     };
 
-    // Build a row for every entry, sorted NEW-first
+    // Build a row for every entry, sorted NEW-first then UNTRUSTED
     const sorted = [...egressEntries].sort((a, b) => {
-      const aNew = newDestsSet.has(a.key) ? 0 : 1;
-      const bNew = newDestsSet.has(b.key) ? 0 : 1;
-      return aNew - bNew;
+      const rank = (e) => newDestsSet.has(e.key) ? 0 : e.status === 'untrusted' ? 1 : 2;
+      return rank(a) - rank(b);
     });
 
     const destRows = sorted.length > 0
       ? sorted.map(e => {
-        const badge = newDestsSet.has(e.key) ? '⚠️ **NEW**' : (e.status === 'trusted' ? '✅ trusted' : '🔵 baseline');
+        const badge = newDestsSet.has(e.key)
+          ? '⚠️ **NEW**'
+          : e.status === 'untrusted'
+            ? '🚫 **Untrusted**'
+            : e.status === 'trusted'
+              ? '✅ trusted'
+              : '🔵 baseline';
         const count = e.occurrence_count > 1 ? ` ×${e.occurrence_count}` : '';
         return `| \`${e.key}\`${count} | ${procTree(e)} | ${badge} |`;
       }).join('\n')
@@ -40140,13 +40154,13 @@ async function cleanup() {
           $project_name: String, $session_id: String,
           $repo: String!, $job: String!, $branch: String!, $run_id: String!,
           $run_number: String, $workflow: String, $actor: String, $sha: String,
-          $egress: JSON, $fim_events: JSON
+          $egress: JSON, $fim_events: JSON, $allowed_domains: [String]
         ) {
           IngestCIBaseline(
             project_name: $project_name session_id: $session_id
             repo: $repo job: $job branch: $branch run_id: $run_id
             run_number: $run_number workflow: $workflow actor: $actor sha: $sha
-            egress: $egress fim_events: $fim_events
+            egress: $egress fim_events: $fim_events allowed_domains: $allowed_domains
           ) {
             status phase run_count observations deviations new_destinations vuln_id
           }
@@ -40226,7 +40240,7 @@ async function cleanup() {
                 egressEntries.forEach(e => {
                   const proc = e.comm ? ` [${e.comm}]` : '';
                   const count = e.occurrence_count > 1 ? ` ×${e.occurrence_count}` : '';
-                  const badge = e.status === 'trusted' ? '✅' : e.status === 'new' ? '⚠️ NEW' : '🔵';
+                  const badge = e.status === 'trusted' ? '✅' : e.status === 'untrusted' ? '🚫 UNTRUSTED' : e.status === 'new' ? '⚠️ NEW' : '🔵';
                   core.info(`  ${badge} ${e.key}${proc}${count}`);
                 });
                 core.info('─'.repeat(60));
@@ -40301,6 +40315,10 @@ async function cleanup() {
             sha: stepCtx.sha || process.env.GITHUB_SHA || '',
             egress: egressDestinations,
             fim_events: fimObs,
+            allowed_domains: (core.getInput('allowed_domains') || '')
+              .split('\n')
+              .map(l => l.trim())
+              .filter(l => l && !l.startsWith('#')),
           },
         }, {
           headers: { authorization: `apiKey ${apiKey}`, 'Content-Type': 'application/json' },

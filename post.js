@@ -456,7 +456,9 @@ ${(stats.blocked_details || []).map(b =>
     const obsCount = baselineReport.observations ?? knownDests.length;
     const phase = baselineReport.phase || 'learning';
 
-    if (newDestsArr.length > 0) alertIcon = alertIcon === '✅' ? '⚠️' : alertIcon;
+    const untrustedEntries = egressEntries.filter(e => e.status === 'untrusted');
+    if (untrustedEntries.length > 0) alertIcon = '🚨';
+    if (newDestsArr.length > 0 && alertIcon === '✅') alertIcon = '⚠️';
 
     // Process tree: parent_comm → comm
     const procTree = (e) => {
@@ -465,16 +467,21 @@ ${(stats.blocked_details || []).map(b =>
       return '–';
     };
 
-    // Build a row for every entry, sorted NEW-first
+    // Build a row for every entry, sorted NEW-first then UNTRUSTED
     const sorted = [...egressEntries].sort((a, b) => {
-      const aNew = newDestsSet.has(a.key) ? 0 : 1;
-      const bNew = newDestsSet.has(b.key) ? 0 : 1;
-      return aNew - bNew;
+      const rank = (e) => newDestsSet.has(e.key) ? 0 : e.status === 'untrusted' ? 1 : 2;
+      return rank(a) - rank(b);
     });
 
     const destRows = sorted.length > 0
       ? sorted.map(e => {
-        const badge = newDestsSet.has(e.key) ? '⚠️ **NEW**' : (e.status === 'trusted' ? '✅ trusted' : '🔵 baseline');
+        const badge = newDestsSet.has(e.key)
+          ? '⚠️ **NEW**'
+          : e.status === 'untrusted'
+            ? '🚫 **Untrusted**'
+            : e.status === 'trusted'
+              ? '✅ trusted'
+              : '🔵 baseline';
         const count = e.occurrence_count > 1 ? ` ×${e.occurrence_count}` : '';
         return `| \`${e.key}\`${count} | ${procTree(e)} | ${badge} |`;
       }).join('\n')
@@ -818,7 +825,7 @@ async function cleanup() {
                 egressEntries.forEach(e => {
                   const proc = e.comm ? ` [${e.comm}]` : '';
                   const count = e.occurrence_count > 1 ? ` ×${e.occurrence_count}` : '';
-                  const badge = e.status === 'trusted' ? '✅' : e.status === 'new' ? '⚠️ NEW' : '🔵';
+                  const badge = e.status === 'trusted' ? '✅' : e.status === 'untrusted' ? '🚫 UNTRUSTED' : e.status === 'new' ? '⚠️ NEW' : '🔵';
                   core.info(`  ${badge} ${e.key}${proc}${count}`);
                 });
                 core.info('─'.repeat(60));
