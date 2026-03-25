@@ -336,18 +336,21 @@ async function cleanup() {
       try { process.kill(parseInt(interceptorPid), 'SIGTERM'); } catch (_) { }
       await sleep(500);
     }
-    // 2. Signal ROC binary to flush summary
-    const rocPid = core.getState("rocPid");
-    if (rocPid) {
-      core.info(`Sending SIGINT to ROC process PID: ${rocPid}`);
-      try { await exec.exec("sudo", ["kill", "-SIGINT", rocPid]); } catch (_) { }
-      // Wait long enough for the binary to complete IngestCIBaseline HTTP call (~8s timeout)
-      await sleep(10000);
+    // 2. Signal ROC container (ecapture PID 1) to flush and exit.
+    //    rocPid is the PID of 'sudo docker run -d' which exits immediately, so
+    //    kill -SIGINT rocPid is ineffective. Use 'docker kill' to send SIGINT
+    //    directly to ecapture (container PID 1) and give it time to flush.
+    if (containerId) {
+      core.info(`Sending SIGINT to ROC container ${containerId} (ecapture PID 1)...`);
+      try { await exec.exec("sudo", ["docker", "kill", "-s", "SIGINT", containerId]); } catch (_) { }
+      // Wait for ecapture to complete FlushEgressBaseline HTTP call (8s timeout in binary)
+      core.info("Waiting 12s for ecapture to flush egress baseline to backend...");
+      await sleep(12000);
     }
-    // 2. Stop container — give 20s grace period so binary can finish flushing
+    // 3. Stop container — give 10s grace period (binary should have exited after flush above)
     if (containerId) {
       core.info(`Stopping ROC container: ${containerId}`);
-      try { await exec.exec("sudo", ["docker", "stop", "--timeout=20", containerId]); } catch (_) { }
+      try { await exec.exec("sudo", ["docker", "stop", "--timeout=10", containerId]); } catch (_) { }
     }
   } catch (e) {
     core.warning(`Error during ROC stop: ${e.message}`);
@@ -470,12 +473,12 @@ async function cleanup() {
       core.info(`[Baseline] ${egressDestinations.length} egress connections to process`);
       core.info(`[Baseline] ${new Set(egressDestinations.map(d => d.key)).size} unique egress destinations after dedup`);
 
-      // If post.js has NO egress data (binary captures inside Docker → JSONL empty),
-      // the binary already called IngestCIBaseline at shutdown with the real observations.
-      // Skip the call to avoid creating a duplicate run with 0 observations.
-      // Instead, query the latest baseline run to get the real stats for step summary.
+      // If post.js has NO egress data from the TCPMonitor JSONL, the binary may have
+      // already sent data via IngestCIBaseline (FlushEgressBaseline at shutdown).
+      // Query the latest baseline run for stats rather than calling IngestCIBaseline
+      // with an empty payload.
       if (egressDestinations.length === 0) {
-        core.info('[Baseline] No host-side egress data — binary already ingested via FlushEgressBaseline. Querying latest run for stats.');
+        core.info('[Baseline] No host-side TCP egress data in JSONL — querying latest run from backend for stats (binary sent TLS-level egress at shutdown).');
         try {
           const runCtx = stepCtx.repository || process.env.GITHUB_REPOSITORY || '';
           const runJob = stepCtx.job || process.env.GITHUB_JOB || 'default';
