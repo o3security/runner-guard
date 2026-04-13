@@ -67,6 +67,7 @@ async function run() {
       "--privileged",
       "--pid=host",
       "--net=host",
+      "-v", "/home:/home:ro",
       "-v", "/:/host:ro",
       "-v", "/sys:/sys:ro",
       "-v", "/proc:/proc:ro",
