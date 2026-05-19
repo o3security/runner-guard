@@ -364,25 +364,57 @@ async function startKayoContainer({ image, apiKey, serverUrl, projectName, print
   core.setOutput('kayo_container_id', containerId);
   core.info(`[KAYO] Container started: ${containerId.slice(0, 12)}`);
 
-  // Brief health check.
-  await sleep(5000);
+  // ── Health check ──────────────────────────────────────────────────────
+  // Tetragon's startup is heavy: BPF program load + verifier passes, BTF
+  // discovery, sensor manager init, optional API rule fetch. On a cold
+  // GitHub runner with no warm caches this takes ~10-20s. Poll until the
+  // container settles (running or exited) rather than waiting blindly.
+  let finalStatus = '';
+  for (let i = 0; i < 12; i++) {
+    await sleep(2000);
+    try {
+      finalStatus = execSync(
+        `sudo docker inspect --format='{{.State.Status}} (exit={{.State.ExitCode}})' ${containerId} 2>/dev/null`,
+        { encoding: 'utf8' }
+      ).trim();
+    } catch (_) { finalStatus = 'unknown'; }
+    if (finalStatus.includes('exited') || finalStatus.includes('dead')) break;
+    // Already running and we've waited at least 4s → success
+    if (finalStatus.includes('running') && i >= 1) break;
+  }
+
+  if (finalStatus.includes('running')) {
+    core.info(`✅ KAYO container running (ID: ${containerId.slice(0, 12)}, status: ${finalStatus})`);
+    return;
+  }
+
+  // Container is not running. Dump full logs line-by-line via core.info so
+  // GitHub doesn't truncate them (core.warning emits one-line annotations
+  // which the UI clips at ~4KB — that's why the multi-KB tetragon config
+  // dump showed up cut off as "...export-file-compress:fal" in earlier runs).
+  core.warning(`⚠️ KAYO container is not running (status: ${finalStatus || 'unknown'})`);
+  core.info('────────── KAYO docker logs (full) ──────────');
   try {
-    const status = execSync(
-      `sudo docker inspect --format='{{.State.Status}} (exit={{.State.ExitCode}})' ${containerId} 2>/dev/null`,
-      { encoding: 'utf8' }
-    ).trim();
-    if (status.includes('running')) {
-      core.info(`✅ KAYO container running (ID: ${containerId.slice(0, 12)})`);
+    const logs = execSync(`sudo docker logs ${containerId} 2>&1`, {
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    if (logs.trim()) {
+      for (const line of logs.split('\n')) core.info(line);
     } else {
-      core.warning(`⚠️ KAYO container exited (${status}) — printing docker logs:`);
-      try {
-        const logs = execSync(`sudo docker logs ${containerId} 2>&1 | tail -50`, { encoding: 'utf8' });
-        core.warning(logs || '(no container output)');
-      } catch (_) { /* ignore */ }
+      core.info('(no container output)');
     }
   } catch (e) {
-    core.warning(`[KAYO] Could not verify container status: ${e.message}`);
+    core.info(`could not read logs: ${e.message}`);
   }
+  core.info('────────── end KAYO docker logs ──────────');
+
+  // Also surface the kernel-feature exit reason for the GitHub Actions runner
+  // case: ubuntu-latest runners gate /sys/kernel/debug and some BPF features.
+  core.info('[KAYO] If exit=255, common causes on GitHub-hosted runners:');
+  core.info('       - /sys/kernel/debug not mounted (need privileged + that volume)');
+  core.info('       - kernel BTF missing (some runner images strip it)');
+  core.info('       - api_key/project_name has no rules registered on the backend');
 }
 
 /**
