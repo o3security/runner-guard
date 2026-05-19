@@ -356,6 +356,38 @@ async function cleanup() {
     core.warning(`Error during ROC stop: ${e.message}`);
   }
 
+  // ── KAYO runtime security teardown ─────────────────────────────────────
+  // Mirrors the ROC stop sequence: SIGTERM → wait → docker stop. Tetragon's
+  // graceful shutdown drains pinned BPF programs from /sys/fs/bpf so they
+  // don't outlive the runner and fire against recycled PIDs on subsequent jobs.
+  const kayoContainerId = core.getState("kayoContainerId") || "";
+  if (kayoContainerId) {
+    core.info(`KAYO: stopping runtime security container ${kayoContainerId.slice(0, 12)}`);
+    try {
+      await exec.exec("sudo", ["docker", "kill", "-s", "SIGTERM", kayoContainerId]);
+      await sleep(5000);
+      await exec.exec("sudo", ["docker", "stop", "--timeout=30", kayoContainerId]);
+    } catch (e) {
+      core.warning(`KAYO: error during stop: ${e.message}`);
+    }
+    // Print KAYO container logs and the event JSONL so detections show up in the workflow output.
+    try {
+      const kLogs = execSync(`sudo docker logs ${kayoContainerId} 2>&1 | tail -200`, { encoding: "utf8" });
+      core.info("── KAYO container logs (tail 200) ──");
+      core.info(kLogs || "(empty)");
+    } catch (e) { core.info(`KAYO docker logs error: ${e.message}`); }
+    try {
+      if (await fs.pathExists("/tmp/kayo-events/events.jsonl")) {
+        const events = await fs.readFile("/tmp/kayo-events/events.jsonl", "utf8");
+        const count = events.trim() ? events.trim().split("\n").length : 0;
+        core.info(`── KAYO detection events (${count}) ──`);
+        core.info(events.trim() || "(no detections)");
+      } else {
+        core.info("── KAYO event log: NOT FOUND at /tmp/kayo-events/events.jsonl");
+      }
+    } catch (e) { core.info(`KAYO event log read error: ${e.message}`); }
+  }
+
   // 3. Full diagnostics — always print so failures are visible
   core.info("════════════════════════════════════════");
   core.info("ROC AGENT DIAGNOSTICS");

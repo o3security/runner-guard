@@ -98,9 +98,26 @@ inputs:
     required: false
     default: "true"
 
+  # ── Runtime security (KAYO) ───────────────────────────────────────────────
+  runtime_security:
+    description: |
+      Also deploy the KAYO runtime security agent alongside ROC. KAYO uses
+      eBPF kprobes to detect attacks at the kernel level (filesystem access,
+      process exec, network egress) and uploads detections to the same
+      O3 Security backend. Rules are fetched from the backend using the
+      project_name above.
+    required: false
+    default: "false"
+  runtime_security_image:
+    description: "Override the KAYO Docker image"
+    required: false
+    default: "public.ecr.aws/f9o7b7m0/kayo:latest"
+
 outputs:
   roc_pid:
     description: "PID of the background ROC monitor process"
+  kayo_container_id:
+    description: "Container ID of the KAYO runtime security agent (empty when runtime_security=false)"
 
 runs:
   using: "node20"

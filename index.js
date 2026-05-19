@@ -46,6 +46,9 @@ async function run() {
     const printOnly = core.getInput("print_only") === "true";
     const debug = core.getInput("debug") === "true";
     const dockerImage = core.getInput("docker_image") || "public.ecr.aws/f9o7b7m0/roc";
+    // KAYO runtime security agent
+    const runtimeSecurity = core.getInput("runtime_security") === "true";
+    const kayoImage = core.getInput("runtime_security_image") || "public.ecr.aws/f9o7b7m0/kayo:latest";
 
     // ── Inline policy YAML ────────────────────────────────────────────────
     // Convert action inputs to the inline policy YAML and pass to the container.
@@ -263,8 +266,122 @@ async function run() {
       core.warning(`Could not verify container status: ${e.message}`);
     }
 
+    // ── KAYO runtime security agent (optional) ───────────────────────────
+    if (runtimeSecurity) {
+      await startKayoContainer({
+        image: kayoImage,
+        apiKey,
+        serverUrl,
+        projectName: effectiveProject,
+        printOnly,
+        debug,
+      });
+    }
+
   } catch (error) {
     core.setFailed(`ROC Agent failed to start: ${error.message}`);
+  }
+}
+
+/**
+ * Spawns the KAYO runtime security agent in a privileged container alongside
+ * ROC. KAYO uses eBPF kprobes to monitor filesystem access, process exec, and
+ * network egress on the GitHub Actions runner. Detections are uploaded to the
+ * same O3 Security backend; rules are fetched from the backend by project name.
+ */
+async function startKayoContainer({ image, apiKey, serverUrl, projectName, printOnly, debug }) {
+  core.info(`[KAYO] Starting runtime security agent (image: ${image})`);
+
+  // Host directory for KAYO event log (mirrors what `--kayo-report-file` writes
+  // inside the container).
+  try {
+    require('fs').mkdirSync('/tmp/kayo-events', { recursive: true });
+    require('fs').chmodSync('/tmp/kayo-events', 0o777);
+  } catch (_) { /* best-effort */ }
+
+  // Pull image with retry (ECR Public rate-limits unauthenticated pulls).
+  let pulled = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const pull = require('child_process').spawnSync(
+      'sudo', ['docker', 'pull', image],
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 180_000 }
+    );
+    if (pull.status === 0) { pulled = true; break; }
+    const stderr = (pull.stderr || '').toString();
+    const isRateLimit = stderr.includes('toomanyrequests') || stderr.includes('Rate exceeded');
+    if (isRateLimit && attempt < 3) {
+      const wait = attempt * 15;
+      core.warning(`[KAYO] ECR rate limit hit — retrying pull in ${wait}s (attempt ${attempt}/3)…`);
+      await sleep(wait * 1000);
+    } else {
+      core.warning(`[KAYO] Pull failed (attempt ${attempt}/3): ${stderr.trim().slice(0, 200)}`);
+      if (attempt === 3) {
+        core.warning('[KAYO] Skipping runtime security — image pull failed after 3 attempts');
+        return;
+      }
+    }
+  }
+  if (!pulled) return;
+
+  // Tetragon's gRPC server (:54321) and health server (:6789) both default to
+  // ports that may collide with other services on the runner. Override to be safe.
+  const args = [
+    'run', '-d',
+    '--name', 'kayo',
+    '--privileged',
+    '--pid=host',
+    '--network=host',
+    '-v', '/sys/fs/bpf:/sys/fs/bpf',
+    '-v', '/sys/kernel/debug:/sys/kernel/debug',
+    '-v', '/tmp/kayo-events:/var/log/kayo',
+    image,
+    '/usr/bin/tetragon',
+    '--health-server-address=:7789',
+    '--server-address=localhost:54322',
+    '--bpf-dir=tetragon-kayo',
+    '--kayo-report-file=/var/log/kayo/events.jsonl',
+    '--kayo-workers=8',
+  ];
+  if (serverUrl) args.push(`--kayo-server-url=${serverUrl}`);
+  if (apiKey) args.push(`--kayo-apikey=${apiKey}`);
+  if (projectName) args.push(`--kayo-project-name=${projectName}`);
+  if (printOnly) args.push('--kayo-print-only');
+
+  let containerId = '';
+  try {
+    const out = execSync(`sudo docker ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`, {
+      encoding: 'utf8',
+      timeout: 60_000,
+    }).trim();
+    containerId = out.split('\n').pop().trim();
+  } catch (e) {
+    core.warning(`[KAYO] docker run failed: ${e.message}`);
+    return;
+  }
+
+  core.saveState('kayoContainerId', containerId);
+  core.saveState('kayoImage', image);
+  core.setOutput('kayo_container_id', containerId);
+  core.info(`[KAYO] Container started: ${containerId.slice(0, 12)}`);
+
+  // Brief health check.
+  await sleep(5000);
+  try {
+    const status = execSync(
+      `sudo docker inspect --format='{{.State.Status}} (exit={{.State.ExitCode}})' ${containerId} 2>/dev/null`,
+      { encoding: 'utf8' }
+    ).trim();
+    if (status.includes('running')) {
+      core.info(`✅ KAYO container running (ID: ${containerId.slice(0, 12)})`);
+    } else {
+      core.warning(`⚠️ KAYO container exited (${status}) — printing docker logs:`);
+      try {
+        const logs = execSync(`sudo docker logs ${containerId} 2>&1 | tail -50`, { encoding: 'utf8' });
+        core.warning(logs || '(no container output)');
+      } catch (_) { /* ignore */ }
+    }
+  } catch (e) {
+    core.warning(`[KAYO] Could not verify container status: ${e.message}`);
   }
 }
 
