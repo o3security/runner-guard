@@ -227,7 +227,7 @@ async function runCacheOnlyBaseline(egressRaw) {
 
 async function runIngest(apiKey, serverUrl) {
     // Strip /graphql suffix — server_url is the GraphQL endpoint but ingest is REST
-    const base = (serverUrl || 'https://api.codexsecurity.io').replace(/\/graphql\/?$/, '');
+    const base = (serverUrl || 'https://api.o3.security').replace(/\/graphql\/?$/, '');
     const repo = process.env.GITHUB_REPOSITORY || '';
     const job = process.env.GITHUB_JOB || 'default';
     const branch = process.env.GITHUB_REF_NAME || process.env.GITHUB_REF || 'main';

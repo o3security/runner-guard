@@ -132,7 +132,7 @@ patterns:               # optional: secret detection
 | Input | Default | Description |
 |-------|---------|-------------|
 | `api_key` | _(empty)_ | API key from O3 Security (leave blank for open-source mode) |
-| `server_url` | `https://api.codexsecurity.io/graphql` | O3 Security API URL |
+| `server_url` | `https://api.o3.security/graphql` | O3 Security API URL |
 | `project_name` | _(empty)_ | Project name in the dashboard |
 
 ### Inline policy (open-source mode)

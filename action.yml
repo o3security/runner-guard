@@ -12,7 +12,7 @@ inputs:
   server_url:
     description: "O3 Security API URL"
     required: false
-    default: "https://api.codexsecurity.io/graphql"
+    default: "https://api.o3.security/graphql"
   project_name:
     description: "Project name for grouping results in the O3 Security dashboard"
     required: false

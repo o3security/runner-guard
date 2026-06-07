@@ -16,7 +16,7 @@ jobs:
               id: roc-start
               uses: Securable-ai/roc-agent@v0.0.0
               with:
-                  server_url: https://api.codexsecurity.io/graphql
+                  server_url: https://api.o3.security/graphql
                   api_key: ${{ secrets.ROC_API_KEY }}
                   project_name: ${{ github.repository }}
                   print_only: false

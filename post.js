@@ -287,7 +287,7 @@ ${rows}${more}
   const uniqueDests = stats ? (stats.unique_destinations || 0) : '–';
   const blockedCount = stats ? (stats.blocked_connections || 0) : '–';
 
-  const serverUrl = core.getState("serverUrl") || "https://api.codexsecurity.io";
+  const serverUrl = core.getState("serverUrl") || "https://api.o3.security";
   const dashboardUrl = `${serverUrl}/projects`;
 
   const md = `
@@ -325,7 +325,7 @@ async function cleanup() {
   const egressPolicy = core.getState("egressPolicy") || "audit";
   const containerId = core.getState("containerId") || "";
   const apiKey = core.getInput("api_key") || "";
-  const serverUrl = core.getState("serverUrl") || "https://api.codexsecurity.io";
+  const serverUrl = core.getState("serverUrl") || "https://api.o3.security";
 
   core.info("O3 Security ROC Agent: stopping monitor and collecting results...");
 
