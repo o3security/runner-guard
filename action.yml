@@ -1,0 +1,137 @@
+name: "Secure CI"
+description: "EDR for GitHub Actions runners — detect leaked secrets, block unexpected egress, and catch anomalies in real time."
+author: "O3 Security"
+
+inputs:
+  # ── O3 Security dashboard (optional) ─────────────────────────────────────
+  # Leave blank to run in open-source mode with inline policy below.
+  api_key:
+    description: "API key for O3 Security authentication (store in GitHub Secrets)"
+    required: false
+    default: ""
+  server_url:
+    description: "O3 Security API URL"
+    required: false
+    default: "https://api.o3.security/graphql"
+  project_name:
+    description: "Project name for grouping results in the O3 Security dashboard"
+    required: false
+    default: ""
+
+  # ── Inline policy (open-source / no-dashboard mode) ───────────────────────
+  # Configure egress policy without logging in to the O3 Security dashboard.
+  # The action converts these inputs to a policy YAML file internally.
+  policy:
+    description: |
+      Egress enforcement mode:
+        audit  — monitor and log all outbound connections (default, safe)
+        block  — drop TCP 80/443 connections not in the allowlist below
+    required: false
+    default: "audit"
+  allowed_domains:
+    description: |
+      Allowed outbound domains when policy=block.
+      One per line, or comma-separated. Supports host:port (e.g. api.github.com:443)
+      and plain hostnames (allows both 80 and 443).
+    required: false
+    default: ""
+  allowed_ips:
+    description: |
+      Allowed outbound IPs when policy=block.
+      One per line, or comma-separated (e.g. 1.1.1.1).
+    required: false
+    default: ""
+  allowed_cidrs:
+    description: |
+      Allowed outbound IP ranges when policy=block.
+      One per line, or comma-separated CIDR notation (e.g. 10.0.0.0/8).
+    required: false
+    default: ""
+
+  # ── Secret detection ──────────────────────────────────────────────────────
+  patterns:
+    description: |
+      Secret scanning patterns. Accepts either:
+        1. A file path:   .github/secure-ci-patterns.yaml
+        2. Inline YAML content (use | for multiline):
+             - id: aws_key
+               regex: 'AKIA[0-9A-Z]{16}'
+             - id: github_token
+               regex: 'ghp_[A-Za-z0-9]{36}'
+    required: false
+
+  # ── SIEM integration (optional) ───────────────────────────────────────────
+  splunk_url:
+    description: "Splunk HEC URL for direct SIEM integration"
+    required: false
+  splunk_token:
+    description: "Splunk HEC token (store in GitHub Secrets)"
+    required: false
+  es_url:
+    description: "Elasticsearch cluster URL"
+    required: false
+  es_index:
+    description: "Elasticsearch index name"
+    required: false
+  es_user:
+    description: "Elasticsearch username"
+    required: false
+  es_pass:
+    description: "Elasticsearch password (store in GitHub Secrets)"
+    required: false
+
+  # ── Advanced ──────────────────────────────────────────────────────────────
+  fail_on_error:
+    description: |
+      If the scanner itself fails to start (image pull error, startup failure),
+      fail the build. Default false (fail-open): the action warns and the build
+      continues — a registry hiccup should not break your pipeline. Set true to
+      require the scanner to be running.
+    required: false
+    default: "false"
+  print_only:
+    description: "Print captured events to stdout only — skip upload to O3 backend (useful for testing)"
+    required: false
+    default: "false"
+  debug:
+    description: "Enable verbose debug logging"
+    required: false
+    default: "false"
+  docker_image:
+    description: "Override the Secure CI Docker image (for air-gapped environments)"
+    required: false
+    default: "asia-south1-docker.pkg.dev/o3-public-artifacts/o3-public/roc"
+  baseline_enabled:
+    description: "Enable automated egress baseline — flags new destinations not seen in previous runs (uses GitHub Actions Cache)"
+    required: false
+    default: "true"
+
+  # ── Runtime security (KAYO) ───────────────────────────────────────────────
+  runtime_security:
+    description: |
+      Also deploy the KAYO runtime security agent alongside Secure CI. KAYO uses
+      eBPF kprobes to detect attacks at the kernel level (filesystem access,
+      process exec, network egress) and uploads detections to the same
+      O3 Security backend. Rules are fetched from the backend using the
+      project_name above.
+    required: false
+    default: "false"
+  runtime_security_image:
+    description: "Override the KAYO Docker image"
+    required: false
+    default: "asia-south1-docker.pkg.dev/o3-public-artifacts/o3-public/kayo:latest"
+
+outputs:
+  guard_pid:
+    description: "PID of the background Secure CI monitor process"
+  kayo_container_id:
+    description: "Container ID of the KAYO runtime security agent (empty when runtime_security=false)"
+
+runs:
+  using: "node24"
+  main: "dist/index.js"
+  post: "dist/post/index.js"
+
+branding:
+  icon: "shield"
+  color: "purple"
