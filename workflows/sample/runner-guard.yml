@@ -1,0 +1,29 @@
+name: Runner Guard
+on:
+    workflow_dispatch:
+
+jobs:
+    runner-guard:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Start Runner Guard
+              id: guard
+              uses: o3security/runner-guard@v1
+              with:
+                  server_url: https://api.o3.security/graphql
+                  api_key: ${{ secrets.O3_API_KEY }}
+                  project_name: ${{ github.repository }}
+                  debug: "true"
+
+            - name: Build
+              run: |
+                  # Your real build goes here. Runner Guard runs in the background
+                  # and reports any secret or unexpected egress it sees during it.
+                  npm ci || true
+                  npm run build || true

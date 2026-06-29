@@ -1,7 +1,7 @@
 {
-    "name": "roc-github-action",
+    "name": "runner-guard",
     "version": "1.0.0",
-    "description": "GitHub Action for ROC network analysis",
+    "description": "GitHub Action that watches a CI/CD runner for exfiltrated secrets and unexpected egress.",
     "main": "index.js",
     "scripts": {
         "build": "npm run build:main && npm run build:post && npm run build:interceptor",

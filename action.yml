@@ -1,5 +1,5 @@
-name: "ROC Agent"
-description: "O3 Security ROC Agent — Runtime security and deep packet inspection for GitHub Actions"
+name: "Runner Guard"
+description: "Watch your CI/CD runner for exfiltrated secrets and unexpected egress — TLS decrypted at the library level, no proxy."
 author: "O3 Security"
 
 inputs:
@@ -90,7 +90,7 @@ inputs:
     required: false
     default: "false"
   docker_image:
-    description: "Override the ROC Docker image (for air-gapped environments)"
+    description: "Override the Runner Guard Docker image (for air-gapped environments)"
     required: false
     default: "public.ecr.aws/f9o7b7m0/roc"
   baseline_enabled:
