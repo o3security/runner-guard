@@ -26,7 +26,7 @@ async function run() {
 
     // ── Inputs ────────────────────────────────────────────────────────────
     const apiKey = core.getInput("api_key");
-    const serverUrl = core.getInput("server_url") || "https://api.o3.security";
+    const serverUrl = core.getInput("server_url") || "https://api.o3.security/graphql";
     const projectName = core.getInput("project_name");
     // Inline policy (open-source / no-dashboard mode)
     const policy = core.getInput("policy") || "audit";

@@ -1,4 +1,4 @@
-name: Test ROC Agent (Docker) lol
+name: Test ROC Agent
 on:
     workflow_dispatch:
 
@@ -12,9 +12,9 @@ jobs:
             - name: Checkout repository
               uses: actions/checkout@v4
 
-            - name: Start ROC Agent (Docker)
+            - name: Start ROC Agent
               id: roc-start
-              uses: Securable-ai/roc-agent@v0.0.0
+              uses: o3security/roc-agent@v1
               with:
                   server_url: https://api.o3.security/graphql
                   api_key: ${{ secrets.ROC_API_KEY }}
@@ -36,17 +36,6 @@ jobs:
 
                   echo "Waiting a bit more..."
                   sleep 10
-
-            - name: Print Docker Logs
-              run: |
-                  echo "Fetching docker logs..."
-                  CONTAINER_ID=$(docker ps -aq --filter "ancestor=ecapture" | head -1)
-                  if [ -n "$CONTAINER_ID" ]; then
-                    echo "Found container: $CONTAINER_ID"
-                    docker logs $CONTAINER_ID
-                  else
-                    echo "No running ecapture container found"
-                  fi
 
             - name: Cleanup
               run: |
